@@ -251,7 +251,8 @@ fn handle_sse_data(
         }
     }
     // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning`
-    // carry streamed thinking text.
+    // carry streamed thinking text; OpenRouter-style `reasoning_details`
+    // carries it as typed parts (text, or summary for summarized thinking).
     if let Some(reasoning) = delta
         .get("reasoning_content")
         .or_else(|| delta.get("reasoning"))
@@ -259,6 +260,22 @@ fn handle_sse_data(
     {
         if !reasoning.is_empty() {
             emit(WireEvent::ReasoningDelta(reasoning.to_string()))?;
+        }
+    } else {
+        for detail in delta
+            .get("reasoning_details")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let text = match detail.get("type").and_then(Value::as_str) {
+                Some("reasoning.text") => detail.get("text"),
+                Some("reasoning.summary") => detail.get("summary"),
+                _ => None,
+            };
+            if let Some(text) = text.and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                emit(WireEvent::ReasoningDelta(text.to_string()))?;
+            }
         }
     }
     for call in delta
@@ -476,6 +493,26 @@ mod tests {
                 reasoning_tokens: 3,
             })
         );
+    }
+
+    #[test]
+    fn reasoning_details_deltas_emit_reasoning_events() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"We \",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"add\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"2\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut reasoning = String::new();
+        read_sse_stream(sse.as_bytes(), |event| {
+            if let WireEvent::ReasoningDelta(delta) = event {
+                reasoning.push_str(&delta);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(reasoning, "We add");
     }
 
     #[test]
