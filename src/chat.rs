@@ -25,7 +25,8 @@ pub struct ChatRequest<'a> {
     /// Responses-style tool definitions; converted to the nested chat format.
     pub tools: &'a [Value],
     pub max_output_tokens: u64,
-    /// "" or "none" omits the field entirely.
+    /// "" omits the field (the model's default). "none" is sent as is: models
+    /// that think by default (DeepSeek, GLM) otherwise keep thinking.
     pub reasoning_effort: &'a str,
 }
 
@@ -46,7 +47,7 @@ pub fn request_body(request: &ChatRequest<'_>) -> Value {
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!("auto");
     }
-    if !matches!(request.reasoning_effort, "" | "none") {
+    if !request.reasoning_effort.is_empty() {
         body["reasoning_effort"] = json!(request.reasoning_effort);
     }
     body
@@ -694,7 +695,7 @@ mod tests {
             input: &[],
             tools: &tools,
             max_output_tokens: 2048,
-            reasoning_effort: "none",
+            reasoning_effort: "",
         };
         let body = request_body(&request);
 
@@ -703,6 +704,13 @@ mod tests {
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["tool_choice"], "auto");
         assert!(body.get("reasoning_effort").is_none());
+
+        // An explicit "none" turns thinking off instead of leaving the default.
+        let body = request_body(&ChatRequest {
+            reasoning_effort: "none",
+            ..request
+        });
+        assert_eq!(body["reasoning_effort"], "none");
 
         let request = ChatRequest {
             reasoning_effort: "high",
