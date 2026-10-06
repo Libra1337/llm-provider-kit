@@ -43,9 +43,10 @@ pub fn request_body(request: &ChatRequest<'_>) -> Value {
         body["max_tokens"] = json!(request.max_output_tokens);
     }
     let tools = tools_from_definitions(request.tools);
+    // `tool_choice` is left out: "auto" is the default with tools, and some
+    // gateways that translate to Anthropic reject the string form.
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
-        body["tool_choice"] = json!("auto");
     }
     if !request.reasoning_effort.is_empty() {
         body["reasoning_effort"] = json!(request.reasoning_effort);
@@ -702,7 +703,8 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert_eq!(body["max_tokens"], 2048);
-        assert_eq!(body["tool_choice"], "auto");
+        assert!(body["tools"].is_array());
+        assert!(body.get("tool_choice").is_none());
         assert!(body.get("reasoning_effort").is_none());
 
         // An explicit "none" turns thinking off instead of leaving the default.

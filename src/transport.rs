@@ -11,7 +11,8 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
-    sync::{Arc, OnceLock},
+    io::Read,
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::Duration,
 };
@@ -141,11 +142,7 @@ impl Client {
         body: &Value,
         read_timeout: Duration,
     ) -> Result<ureq::Response, RequestError> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(self.connect_timeout)
-            .timeout_read(read_timeout)
-            .build();
-        let mut request = agent
+        let mut request = shared_agent(self.connect_timeout, read_timeout)
             .post(url)
             .set("Accept", "text/event-stream")
             .set("Content-Type", "application/json")
@@ -305,7 +302,8 @@ impl Client {
                 return Ok(output_items);
             }
             let mut buffered: Vec<WireEvent> = Vec::new();
-            let read = read_sse(protocol, response.into_reader(), |event| match event {
+            let mut reader = response.into_reader();
+            let read = read_sse(protocol, &mut reader, |event| match event {
                 event @ (WireEvent::Delta(_) | WireEvent::ReasoningDelta(_)) => {
                     emit(StreamEvent::Wire(event))
                 }
@@ -316,6 +314,7 @@ impl Client {
             });
             match read {
                 Ok(output_items) => {
+                    release_connection(reader);
                     for event in buffered {
                         emit(StreamEvent::Wire(event))?;
                     }
@@ -362,7 +361,9 @@ impl Client {
             }
             return Ok(text);
         }
-        read_sse(protocol, response.into_reader(), &mut accumulate)?;
+        let mut reader = response.into_reader();
+        read_sse(protocol, &mut reader, &mut accumulate)?;
+        release_connection(reader);
         Ok(text)
     }
 
@@ -393,6 +394,35 @@ pub fn azure_api_version() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| AZURE_DEFAULT_API_VERSION.to_string())
+}
+
+/// One agent per timeout pair, kept for the process: its pool keeps the TLS
+/// connection to a provider open between requests, so a turn's tool rounds
+/// skip the handshake (a second or more through a proxy) after the first.
+fn shared_agent(connect_timeout: Duration, read_timeout: Duration) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<HashMap<(Duration, Duration), ureq::Agent>>> = OnceLock::new();
+    let mut agents = AGENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    agents
+        .entry((connect_timeout, read_timeout))
+        .or_insert_with(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(connect_timeout)
+                .timeout_read(read_timeout)
+                .build()
+        })
+        .clone()
+}
+
+/// A stream parser stops at the protocol's last event, before the body's
+/// end; the connection goes back to the pool only once the body is read
+/// through. The rest (a chunk terminator) is read off the turn's path.
+fn release_connection(mut reader: Box<dyn Read + Send + Sync>) {
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut (&mut reader).take(1 << 20), &mut std::io::sink());
+    });
 }
 
 /// Dispatches to the protocol's SSE parser.
@@ -745,6 +775,52 @@ mod tests {
         assert_eq!(connected, 1);
         assert_eq!(deltas, vec!["hi".to_string()]);
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn consecutive_streams_reuse_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut accepted = 0;
+            while let Ok((mut stream, _)) = listener.accept() {
+                accepted += 1;
+                let _ = tx.send(accepted);
+                // Keep-alive: answer every request on this connection, the
+                // body chunked as a provider streams it.
+                while read_request(&mut stream).is_ok_and(|request| !request.is_empty()) {
+                    let event = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n0\r\n\r\n",
+                        event.len()
+                    );
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let client = test_client();
+        for _ in 0..2 {
+            client
+                .stream(
+                    Protocol::OpenAiResponses,
+                    &format!("{base}/responses"),
+                    &serde_json::json!({ "model": "test" }),
+                    Duration::from_secs(5),
+                    &mut |_| Ok(()),
+                )
+                .expect("stream succeeds");
+            // The body's tail is read off the turn's path before the
+            // connection is pooled again.
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(rx.recv().expect("one connection"), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "the second request opened a new connection"
+        );
     }
 
     #[test]
