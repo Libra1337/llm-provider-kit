@@ -182,9 +182,141 @@ pub fn tools_from_definitions(definitions: &[Value]) -> Vec<Value> {
 #[derive(Default)]
 struct StreamState {
     text: String,
+    think: ThinkSplitter,
     tool_calls: BTreeMap<u64, ToolCall>,
     usage: Option<Usage>,
     finish_reason: String,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Some gateways (reasoning models behind a plain Chat proxy) stream the
+/// thinking inside `content` as a leading `<think>…</think>` block instead of
+/// `reasoning_content`. This splits that block off as reasoning, also when a
+/// tag is cut across chunks; content that does not open with it passes through.
+#[derive(Default)]
+struct ThinkSplitter {
+    phase: ThinkPhase,
+    buf: String,
+    /// Drops the newlines between `</think>` and the answer.
+    trim_answer: bool,
+}
+
+#[derive(Default, PartialEq)]
+enum ThinkPhase {
+    /// Not yet known whether the content opens with `<think>`.
+    #[default]
+    Start,
+    Thinking,
+    Answer,
+}
+
+/// A piece of `content`: reasoning (true) or answer text (false).
+type ContentPart = (bool, String);
+
+impl ThinkSplitter {
+    fn push(&mut self, chunk: &str) -> Vec<ContentPart> {
+        let mut out = Vec::new();
+        match self.phase {
+            ThinkPhase::Answer => self.answer(chunk.to_string(), &mut out),
+            ThinkPhase::Start => {
+                self.buf.push_str(chunk);
+                let lead = self.buf.trim_start();
+                if let Some(rest) = lead.strip_prefix(THINK_OPEN) {
+                    let rest = rest.to_string();
+                    self.buf.clear();
+                    self.phase = ThinkPhase::Thinking;
+                    self.thinking(&rest, &mut out);
+                } else if !THINK_OPEN.starts_with(lead) {
+                    self.phase = ThinkPhase::Answer;
+                    let text = std::mem::take(&mut self.buf);
+                    self.answer(text, &mut out);
+                }
+            }
+            ThinkPhase::Thinking => self.thinking(chunk, &mut out),
+        }
+        out
+    }
+
+    fn thinking(&mut self, chunk: &str, out: &mut Vec<ContentPart>) {
+        self.buf.push_str(chunk);
+        if let Some(at) = self.buf.find(THINK_CLOSE) {
+            let reasoning = self.buf[..at].to_string();
+            let rest = self.buf[at + THINK_CLOSE.len()..].to_string();
+            self.buf.clear();
+            if !reasoning.is_empty() {
+                out.push((true, reasoning));
+            }
+            self.phase = ThinkPhase::Answer;
+            self.trim_answer = true;
+            self.answer(rest, out);
+            return;
+        }
+        // Hold back a tail that may be the start of `</think>` (ASCII, so the
+        // cut is a char boundary).
+        let keep = (1..THINK_CLOSE.len())
+            .rev()
+            .find(|&n| self.buf.ends_with(&THINK_CLOSE[..n]))
+            .unwrap_or(0);
+        let cut = self.buf.len() - keep;
+        if cut > 0 {
+            let reasoning: String = self.buf.drain(..cut).collect();
+            out.push((true, reasoning));
+        }
+    }
+
+    fn answer(&mut self, mut text: String, out: &mut Vec<ContentPart>) {
+        if self.trim_answer {
+            text = text.trim_start().to_string();
+            if text.is_empty() {
+                return;
+            }
+            self.trim_answer = false;
+        }
+        if !text.is_empty() {
+            out.push((false, text));
+        }
+    }
+
+    /// What is still held when the stream ends: an unclosed block is reasoning.
+    fn finish(&mut self) -> Vec<ContentPart> {
+        let rest = std::mem::take(&mut self.buf);
+        match self.phase {
+            _ if rest.is_empty() => Vec::new(),
+            ThinkPhase::Thinking => vec![(true, rest)],
+            _ => vec![(false, rest)],
+        }
+    }
+}
+
+/// A complete `content` with a leading `<think>…</think>` block removed.
+fn strip_think(content: &str) -> &str {
+    content
+        .trim_start()
+        .strip_prefix(THINK_OPEN)
+        .and_then(|rest| {
+            rest.find(THINK_CLOSE)
+                .map(|at| &rest[at + THINK_CLOSE.len()..])
+        })
+        .map(str::trim_start)
+        .unwrap_or(content)
+}
+
+fn emit_content_parts(
+    parts: Vec<ContentPart>,
+    state_text: &mut String,
+    emit: &mut impl FnMut(WireEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    for (reasoning, text) in parts {
+        if reasoning {
+            emit(WireEvent::ReasoningDelta(text))?;
+        } else {
+            state_text.push_str(&text);
+            emit(WireEvent::Delta(text))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -215,6 +347,8 @@ pub fn read_sse_stream(
     if state.finish_reason.is_empty() {
         return Err("stream closed before finish_reason".to_string());
     }
+    let held = state.think.finish();
+    emit_content_parts(held, &mut state.text, &mut emit)?;
 
     let items = state_to_items(state, &mut emit)?;
     Ok(items)
@@ -248,8 +382,8 @@ fn handle_sse_data(
     };
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
         if !content.is_empty() {
-            state.text.push_str(content);
-            emit(WireEvent::Delta(content.to_string()))?;
+            let parts = state.think.push(content);
+            emit_content_parts(parts, &mut state.text, emit)?;
         }
     }
     // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning`
@@ -353,7 +487,11 @@ pub fn completion_to_items(value: &Value) -> (Vec<Value>, Option<Usage>) {
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"));
     if let Some(message) = message {
-        if let Some(content) = message.get("content").and_then(Value::as_str) {
+        if let Some(content) = message
+            .get("content")
+            .and_then(Value::as_str)
+            .map(strip_think)
+        {
             if !content.is_empty() {
                 items.push(json!({
                     "type": "message",
@@ -404,6 +542,85 @@ fn usage_from_value(usage: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Streams `chunks` as `content` deltas; returns (reasoning, answer, final text).
+    fn split_content(chunks: &[&str]) -> (String, String, String) {
+        let mut sse = String::new();
+        for chunk in chunks {
+            let delta = json!({ "choices": [{ "index": 0, "delta": { "content": chunk }, "finish_reason": null }] });
+            sse.push_str(&format!("data: {delta}\n\n"));
+        }
+        sse.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        let items = read_sse_stream(sse.as_bytes(), |event| {
+            match event {
+                WireEvent::ReasoningDelta(delta) => reasoning.push_str(&delta),
+                WireEvent::Delta(delta) => answer.push_str(&delta),
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        let text = items
+            .iter()
+            .find(|item| item["type"] == "message")
+            .map(|item| item["content"][0]["text"].as_str().unwrap().to_string())
+            .unwrap_or_default();
+        (reasoning, answer, text)
+    }
+
+    #[test]
+    fn leading_think_block_in_content_streams_as_reasoning() {
+        // As the gateway's DeepSeek proxy sends it, with tags cut across chunks.
+        let (reasoning, answer, text) = split_content(&[
+            "<thi",
+            "nk>We need",
+            " to answer 中文.",
+            "</th",
+            "ink>\n",
+            "\n2",
+        ]);
+        assert_eq!(reasoning, "We need to answer 中文.");
+        assert_eq!(answer, "2");
+        assert_eq!(text, "2");
+
+        let (reasoning, answer, _) = split_content(&["<think>", "x", "</think>", "ok"]);
+        assert_eq!((reasoning.as_str(), answer.as_str()), ("x", "ok"));
+    }
+
+    #[test]
+    fn content_without_a_leading_think_block_is_left_alone() {
+        let (reasoning, answer, text) = split_content(&["<", "b>bold</b> and <think> later"]);
+        assert_eq!(reasoning, "");
+        assert_eq!(answer, "<b>bold</b> and <think> later");
+        assert_eq!(text, answer);
+
+        let (reasoning, answer, _) = split_content(&["Hello ", "world"]);
+        assert_eq!((reasoning.as_str(), answer.as_str()), ("", "Hello world"));
+
+        // A lone "<" that never becomes a tag is still answer text.
+        let (reasoning, answer, _) = split_content(&["<"]);
+        assert_eq!((reasoning.as_str(), answer.as_str()), ("", "<"));
+    }
+
+    #[test]
+    fn unclosed_think_block_is_all_reasoning() {
+        let (reasoning, answer, text) = split_content(&["<think>still thinking</thi"]);
+        assert_eq!(reasoning, "still thinking</thi");
+        assert_eq!((answer.as_str(), text.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn non_streaming_completion_drops_a_leading_think_block() {
+        let (items, _) = completion_to_items(&json!({
+            "choices": [{ "message": { "role": "assistant", "content": "<think>plan</think>\n\nanswer" } }]
+        }));
+        assert_eq!(items[0]["content"][0]["text"], "answer");
+        let (items, _) = completion_to_items(&json!({
+            "choices": [{ "message": { "role": "assistant", "content": "a <think>b</think>" } }]
+        }));
+        assert_eq!(items[0]["content"][0]["text"], "a <think>b</think>");
+    }
 
     #[test]
     fn text_deltas_stream_and_assemble_into_a_message_item() {
