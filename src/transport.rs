@@ -258,16 +258,23 @@ impl Client {
                 .header("content-type")
                 .unwrap_or_default()
                 .to_string();
+            let mut reader = std::io::BufReader::new(response.into_reader());
             // The connection can drop while a body is read like any stream.
-            let body = |response: ureq::Response| {
-                response
-                    .into_string()
+            let body = |reader: &mut std::io::BufReader<Box<dyn Read + Send + Sync>>| {
+                let mut text = String::new();
+                reader
+                    .read_to_string(&mut text)
+                    .map(|_| text)
                     .map_err(|error| format!("io error: {error}"))
             };
-            if !content_type.contains("text/event-stream")
-                && !content_type.contains("application/json")
-            {
-                let body = match body(response) {
+            // ChatGPT's Codex endpoint sometimes streams with no content type:
+            // the body itself tells.
+            let kind = match body_kind(&content_type) {
+                BodyKind::Unknown => sniff_body(&mut reader),
+                kind => kind,
+            };
+            if kind == BodyKind::Unknown {
+                let body = match body(&mut reader) {
                     Ok(body) => body,
                     Err(error) if attempt < max_attempts => {
                         wait_to_retry(attempt, max_attempts, &error, None, emit)?;
@@ -277,8 +284,8 @@ impl Client {
                 };
                 return Err(non_json_response_error(protocol, url, &content_type, &body));
             }
-            if content_type.contains("application/json") {
-                let body = match body(response) {
+            if kind == BodyKind::Json {
+                let body = match body(&mut reader) {
                     Ok(body) => body,
                     Err(error) if attempt < max_attempts => {
                         wait_to_retry(attempt, max_attempts, &error, None, emit)?;
@@ -302,7 +309,6 @@ impl Client {
                 return Ok(output_items);
             }
             let mut buffered: Vec<WireEvent> = Vec::new();
-            let mut reader = response.into_reader();
             let read = read_sse(protocol, &mut reader, |event| match event {
                 event @ (WireEvent::Delta(_) | WireEvent::ReasoningDelta(_)) => {
                     emit(StreamEvent::Wire(event))
@@ -314,7 +320,7 @@ impl Client {
             });
             match read {
                 Ok(output_items) => {
-                    release_connection(reader);
+                    release_connection(Box::new(reader));
                     for event in buffered {
                         emit(StreamEvent::Wire(event))?;
                     }
@@ -349,8 +355,16 @@ impl Client {
             }
             Ok(())
         };
-        if content_type.contains("application/json") {
-            let body = response.into_string().map_err(|error| error.to_string())?;
+        let mut reader = std::io::BufReader::new(response.into_reader());
+        let kind = match body_kind(&content_type) {
+            BodyKind::Unknown => sniff_body(&mut reader),
+            kind => kind,
+        };
+        if kind == BodyKind::Json {
+            let mut body = String::new();
+            reader
+                .read_to_string(&mut body)
+                .map_err(|error| error.to_string())?;
             let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
             for item in json_items(protocol, &value).0 {
                 let delta = item_text(&item);
@@ -361,9 +375,8 @@ impl Client {
             }
             return Ok(text);
         }
-        let mut reader = response.into_reader();
         read_sse(protocol, &mut reader, &mut accumulate)?;
-        release_connection(reader);
+        release_connection(Box::new(reader));
         Ok(text)
     }
 
@@ -423,6 +436,45 @@ fn release_connection(mut reader: Box<dyn Read + Send + Sync>) {
     thread::spawn(move || {
         let _ = std::io::copy(&mut (&mut reader).take(1 << 20), &mut std::io::sink());
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Sse,
+    Json,
+    Unknown,
+}
+
+fn body_kind(content_type: &str) -> BodyKind {
+    if content_type.contains("text/event-stream") {
+        BodyKind::Sse
+    } else if content_type.contains("application/json") {
+        BodyKind::Json
+    } else {
+        BodyKind::Unknown
+    }
+}
+
+/// What a body without a usable content type is, from its first bytes
+/// (left in the reader).
+fn sniff_body(reader: &mut impl std::io::BufRead) -> BodyKind {
+    let Ok(head) = reader.fill_buf() else {
+        return BodyKind::Unknown;
+    };
+    let start = head
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&head[..0], |at| &head[at..]);
+    if [&b"event:"[..], b"data:", b"id:", b"retry:", b":"]
+        .iter()
+        .any(|prefix| start.starts_with(prefix))
+    {
+        BodyKind::Sse
+    } else if start.starts_with(b"{") {
+        BodyKind::Json
+    } else {
+        BodyKind::Unknown
+    }
 }
 
 /// Dispatches to the protocol's SSE parser.
@@ -742,6 +794,52 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[test]
+    fn a_body_without_content_type_is_read_by_what_it_starts_with() {
+        let sniff = |body: &str| sniff_body(&mut std::io::BufReader::new(body.as_bytes()));
+        assert_eq!(
+            sniff("event: response.created\ndata: {}\n\n"),
+            BodyKind::Sse
+        );
+        assert_eq!(sniff("\ndata: {}\n\n"), BodyKind::Sse);
+        assert_eq!(sniff(": ping\n\n"), BodyKind::Sse);
+        assert_eq!(sniff("{\"output\":[]}"), BodyKind::Json);
+        assert_eq!(sniff("<html>"), BodyKind::Unknown);
+        assert_eq!(body_kind("text/event-stream; charset=utf-8"), BodyKind::Sse);
+        assert_eq!(body_kind(""), BodyKind::Unknown);
+    }
+
+    #[test]
+    fn stream_reads_sse_sent_without_a_content_type() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let base = serve(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )]);
+        let client = test_client();
+        let mut deltas = Vec::new();
+        client
+            .stream(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({}),
+                Duration::from_secs(5),
+                &mut |event| {
+                    if let StreamEvent::Wire(WireEvent::Delta(delta)) = event {
+                        deltas.push(delta);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(deltas, ["hi"]);
     }
 
     #[test]
