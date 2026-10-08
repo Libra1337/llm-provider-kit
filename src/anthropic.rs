@@ -512,6 +512,11 @@ fn handle_sse_data(
                     "input_json_delta" => {
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             block.arguments.push_str(partial);
+                            emit(WireEvent::ToolArgumentsDelta {
+                                call_id: block.id.clone(),
+                                name: block.name.clone(),
+                                delta: partial.to_string(),
+                            })?;
                         }
                     }
                     _ => {}

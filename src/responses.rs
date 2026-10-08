@@ -183,10 +183,15 @@ fn handle_sse_data(
         "response.function_call_arguments.delta" => {
             if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
                 let entry = streamed_calls.entry(item_id.to_string()).or_default();
+                entry.merge_fields(&event);
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     entry.arguments.push_str(delta);
+                    emit(WireEvent::ToolArgumentsDelta {
+                        call_id: entry.call_id.clone(),
+                        name: entry.name.clone(),
+                        delta: delta.to_string(),
+                    })?;
                 }
-                entry.merge_fields(&event);
             }
         }
         // The terminal arguments event carries the full string when populated.

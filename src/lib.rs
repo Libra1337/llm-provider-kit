@@ -114,6 +114,13 @@ pub enum WireEvent {
     ReasoningDelta(String),
     /// A completed Responses-style output item (message, function_call, ...).
     ResponseItem(Value),
+    /// A fragment of a tool call's arguments as it streams in; `call_id` and
+    /// `name` are empty until the provider has sent them.
+    ToolArgumentsDelta {
+        call_id: String,
+        name: String,
+        delta: String,
+    },
     /// Final token usage for the response.
     Usage(Usage),
 }

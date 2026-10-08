@@ -435,6 +435,13 @@ fn handle_sse_data(
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 entry.arguments.push_str(arguments);
+                if !arguments.is_empty() {
+                    emit(WireEvent::ToolArgumentsDelta {
+                        call_id: entry.id.clone(),
+                        name: entry.name.clone(),
+                        delta: arguments.to_string(),
+                    })?;
+                }
             }
         }
     }
