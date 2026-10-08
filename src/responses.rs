@@ -157,7 +157,9 @@ fn handle_sse_data(
                 emit(WireEvent::Delta(delta.to_string()))?;
             }
         }
-        "response.reasoning_summary_text.delta" => {
+        // Summaries (OpenAI) and raw reasoning text (gateways that relay a
+        // model's own thinking, e.g. LynShen's LS-Auto) are both thinking.
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                 emit(WireEvent::ReasoningDelta(delta.to_string()))?;
             }
@@ -384,6 +386,28 @@ fn sanitize_input_item(mut item: Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_text_delta_emits_reasoning_event() {
+        let sse = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"Reading a page\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        );
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let _ = read_sse_stream(sse.as_bytes(), |event| {
+            match event {
+                WireEvent::ReasoningDelta(delta) => reasoning.push_str(&delta),
+                WireEvent::Delta(delta) => text.push_str(&delta),
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(reasoning, "Reading a page");
+        assert_eq!(text, "answer");
+    }
 
     #[test]
     fn reasoning_summary_delta_emits_reasoning_event() {
