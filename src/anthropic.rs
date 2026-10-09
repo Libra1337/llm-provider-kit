@@ -48,6 +48,11 @@ pub fn is_official_url(url: &str) -> bool {
 pub struct AnthropicRequest<'a> {
     pub model: &'a str,
     pub system_prompt: &'a str,
+    /// Length in bytes of the system prompt's start that stays the same
+    /// across sessions and days (the rest names the directory, the date...).
+    /// The cache breakpoint goes there, so sessions and subagents share that
+    /// prefix; None marks the whole prompt.
+    pub stable_system_len: Option<usize>,
     pub input: &'a [Value],
     /// Tool declarations in [`tool_definitions`] form.
     pub tools: &'a [Value],
@@ -76,11 +81,22 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     let mut messages = input_to_messages(request.input, thinks);
     mark_cache_breakpoint(&mut messages);
     // An empty text block is rejected, so only a non-empty system prompt
-    // carries a breakpoint.
-    let system = if request.system_prompt.is_empty() {
+    // carries a breakpoint, and an empty part is left out.
+    let prompt = request.system_prompt;
+    let split = request
+        .stable_system_len
+        .filter(|&at| at > 0 && at < prompt.len() && prompt.is_char_boundary(at))
+        .unwrap_or(prompt.len());
+    let (stable, rest) = prompt.split_at(split);
+    let system = if prompt.is_empty() {
         json!("")
+    } else if rest.trim().is_empty() {
+        json!([{ "type": "text", "text": prompt, "cache_control": { "type": "ephemeral" } }])
     } else {
-        json!([{ "type": "text", "text": request.system_prompt, "cache_control": { "type": "ephemeral" } }])
+        json!([
+            { "type": "text", "text": stable, "cache_control": { "type": "ephemeral" } },
+            { "type": "text", "text": rest }
+        ])
     };
     let mut body = json!({
         "model": request.model,
@@ -944,6 +960,7 @@ mod tests {
         let body = request_body(&AnthropicRequest {
             model: "claude-sonnet-4-5",
             system_prompt: "system",
+            stable_system_len: None,
             input: &input,
             tools: &tools,
             max_output_tokens: 8_192,
@@ -966,10 +983,47 @@ mod tests {
     }
 
     #[test]
+    fn the_breakpoint_marks_only_the_stable_start_of_the_system_prompt() {
+        let prompt = "base and tools\n\n<env>\nDate: 2026-10-09\n</env>";
+        let stable = prompt.find("\n\n<env>").unwrap();
+        let body = request_body(&AnthropicRequest {
+            model: "claude-opus-5-5",
+            system_prompt: prompt,
+            stable_system_len: Some(stable),
+            input: &[],
+            tools: &[],
+            max_output_tokens: 8_192,
+            reasoning_effort: "high",
+        });
+        assert_eq!(body["system"][0]["text"], "base and tools");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["system"][1]["text"],
+            "\n\n<env>\nDate: 2026-10-09\n</env>"
+        );
+        assert!(body["system"][1].get("cache_control").is_none());
+        // Nothing after the stable part, or an offset that does not fit: one block.
+        for split in [Some(prompt.len()), Some(0), Some(prompt.len() + 5), None] {
+            let body = request_body(&AnthropicRequest {
+                model: "claude-opus-5-5",
+                system_prompt: prompt,
+                stable_system_len: split,
+                input: &[],
+                tools: &[],
+                max_output_tokens: 8_192,
+                reasoning_effort: "high",
+            });
+            assert_eq!(body["system"].as_array().unwrap().len(), 1, "{split:?}");
+            assert_eq!(body["system"][0]["text"], prompt);
+        }
+    }
+
+    #[test]
     fn unknown_output_cap_sends_the_required_default() {
         let body = request_body(&AnthropicRequest {
             model: "claude-opus-5-5",
             system_prompt: "",
+            stable_system_len: None,
             input: &[],
             tools: &[],
             max_output_tokens: 0,
@@ -990,6 +1044,7 @@ mod tests {
             let body = request_body(&AnthropicRequest {
                 model,
                 system_prompt: "system",
+                stable_system_len: None,
                 input: &[],
                 tools: &[],
                 max_output_tokens: 32_000,
@@ -1001,6 +1056,7 @@ mod tests {
         let none = request_body(&AnthropicRequest {
             model: "claude-opus-5-5",
             system_prompt: "system",
+            stable_system_len: None,
             input: &[],
             tools: &[],
             max_output_tokens: 32_000,
@@ -1026,6 +1082,7 @@ mod tests {
         let body = request_body(&AnthropicRequest {
             model: "claude-haiku-4-5",
             system_prompt: "system",
+            stable_system_len: None,
             input: &[],
             tools: &[],
             max_output_tokens: 1_024,
