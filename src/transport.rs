@@ -12,9 +12,13 @@ use std::{
     collections::HashMap,
     env,
     io::Read,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc, Mutex, OnceLock,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 // Codex's schedule (doubling from a base, ±10% jitter), from a larger base:
@@ -24,6 +28,15 @@ const RETRY_BACKOFF_BASE_MS: u64 = 1_000;
 const RETRY_BACKOFF_MAX_MS: u64 = 30_000;
 /// The longest a server's Retry-After is honored.
 const RETRY_AFTER_MAX_MS: u64 = 60_000;
+/// How soon a request notices its interrupt flag while it waits: before a
+/// retry, for the response head, for the next bytes of the body.
+const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+/// What an interrupted request fails with (see [`Client::set_interrupt`]).
+pub const INTERRUPTED: &str = "interrupted";
+/// A body is read ahead of its parser in pieces of this size, at most this
+/// many of them (see `PumpedBody`).
+const BODY_PIECE: usize = 16 * 1024;
+const BODY_PIECES_AHEAD: usize = 64;
 /// Prompt-cache stickiness header the Codex backend returns.
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 /// The Codex backend version-gates model availability on this value.
@@ -117,6 +130,8 @@ pub struct Client {
     cache_debug: bool,
     model_headers: Arc<HashMap<String, Vec<(String, String)>>>,
     turn_state: Arc<OnceLock<String>>,
+    /// Set by the request's owner to stop it (see `set_interrupt`).
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 impl Client {
@@ -130,16 +145,84 @@ impl Client {
             cache_debug: config.cache_debug,
             model_headers: Arc::new(config.model_headers),
             turn_state: Arc::new(OnceLock::new()),
+            interrupt: None,
         }
     }
 
+    /// The flag that stops this client's requests: once it is set, `stream`,
+    /// `send_with_retry` and `read_text` fail with [`INTERRUPTED`] within
+    /// [`INTERRUPT_POLL`], whatever they wait on: the wait before a retry,
+    /// a connection that does not come up, a response head or body bytes
+    /// that do not come. The request itself is left to end on its own
+    /// thread (its timeouts) and its result is dropped; nothing it reads
+    /// reaches the caller. Clones made afterwards share the flag.
+    pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
+        self.interrupt = Some(flag);
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
     /// One attempt, with the client's read timeout. Retry policy belongs to
-    /// the caller so a one-shot probe can fail fast.
+    /// the caller so a one-shot probe can fail fast. With an interrupt flag
+    /// (`set_interrupt`) the request runs on a thread of its own, so that
+    /// setting the flag ends the wait for it at once (connecting, sending,
+    /// the response head); the abandoned request ends on its own and its
+    /// response is dropped unread.
     pub fn send(
         &self,
         protocol: Protocol,
         url: &str,
         body: &Value,
+        read_timeout: Duration,
+    ) -> Result<ureq::Response, RequestError> {
+        let Some(flag) = self.interrupt.clone() else {
+            return self.send_value(protocol, url, body.clone(), read_timeout);
+        };
+        if flag.load(Ordering::SeqCst) {
+            return Err(interrupted_request());
+        }
+        let (sent, result) = mpsc::channel();
+        let (client, request_url, request_body) = (self.clone(), url.to_string(), body.clone());
+        let spawned = thread::Builder::new()
+            .name("llm-request".to_string())
+            .spawn(move || {
+                let _ = sent.send(client.send_value(
+                    protocol,
+                    &request_url,
+                    request_body,
+                    read_timeout,
+                ));
+            });
+        if spawned.is_err() {
+            return self.send_value(protocol, url, body.clone(), read_timeout);
+        }
+        loop {
+            match result.recv_timeout(INTERRUPT_POLL) {
+                Ok(response) => return response,
+                Err(RecvTimeoutError::Timeout) if flag.load(Ordering::SeqCst) => {
+                    return Err(interrupted_request());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(RequestError {
+                        status: None,
+                        message: "the request ended without an answer".to_string(),
+                        retry_after: None,
+                    });
+                }
+            }
+        }
+    }
+
+    fn send_value(
+        &self,
+        protocol: Protocol,
+        url: &str,
+        body: Value,
         read_timeout: Duration,
     ) -> Result<ureq::Response, RequestError> {
         let mut request = shared_agent(self.connect_timeout, read_timeout)
@@ -185,7 +268,7 @@ impl Client {
                 self.turn_state.get().is_some()
             );
         }
-        let response = request.send_json(body.clone()).map_err(map_ureq_error)?;
+        let response = request.send_json(body).map_err(map_ureq_error)?;
         let saw_turn_state = capture_turn_state(&response, &self.turn_state);
         if self.cache_debug {
             eprintln!(
@@ -209,8 +292,9 @@ impl Client {
         for attempt in 1..=max_attempts {
             match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => return Ok(response),
+                Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    wait_to_retry(
+                    self.wait_to_retry(
                         attempt,
                         max_attempts,
                         &error.message,
@@ -222,6 +306,52 @@ impl Client {
             }
         }
         unreachable!("retry loop always returns a response or error")
+    }
+
+    /// A response's body for reading: with an interrupt flag, read on a
+    /// thread of its own (`PumpedBody`), so that a read waiting on a
+    /// connection that went quiet ends as interrupted once the flag is set.
+    fn body_reader(&self, response: ureq::Response) -> Box<dyn Read + Send> {
+        let body = response.into_reader();
+        match &self.interrupt {
+            Some(flag) => PumpedBody::start(body, Arc::clone(flag)),
+            None => body,
+        }
+    }
+
+    /// Announces the next attempt after failed attempt `attempt` and waits
+    /// for it: the backoff, or the server's Retry-After when that is longer.
+    /// The interrupt flag cuts the wait short.
+    fn wait_to_retry(
+        &self,
+        attempt: usize,
+        max_attempts: usize,
+        reason: &str,
+        retry_after: Option<Duration>,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let delay = retry_delay(attempt, retry_after, jitter());
+        emit(StreamEvent::Retrying {
+            attempt: attempt + 1,
+            max_attempts,
+            reason: reason.to_string(),
+            delay_ms: delay.as_millis() as u64,
+        })?;
+        let Some(flag) = &self.interrupt else {
+            thread::sleep(delay);
+            return Ok(());
+        };
+        let due = Instant::now() + delay;
+        loop {
+            if flag.load(Ordering::SeqCst) {
+                return Err(INTERRUPTED.to_string());
+            }
+            let left = due.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            thread::sleep(left.min(INTERRUPT_POLL));
+        }
     }
 
     /// Sends one streaming request and returns its completed output items.
@@ -241,8 +371,9 @@ impl Client {
             // stream failures cannot multiply into nested retry rounds.
             let response = match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => response,
+                Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    wait_to_retry(
+                    self.wait_to_retry(
                         attempt,
                         max_attempts,
                         &error.message,
@@ -258,9 +389,9 @@ impl Client {
                 .header("content-type")
                 .unwrap_or_default()
                 .to_string();
-            let mut reader = std::io::BufReader::new(response.into_reader());
+            let mut reader = std::io::BufReader::new(self.body_reader(response));
             // The connection can drop while a body is read like any stream.
-            let body = |reader: &mut std::io::BufReader<Box<dyn Read + Send + Sync>>| {
+            let body = |reader: &mut std::io::BufReader<Box<dyn Read + Send>>| {
                 let mut text = String::new();
                 reader
                     .read_to_string(&mut text)
@@ -276,8 +407,9 @@ impl Client {
             if kind == BodyKind::Unknown {
                 let body = match body(&mut reader) {
                     Ok(body) => body,
+                    Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
                     Err(error) if attempt < max_attempts => {
-                        wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                        self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -287,8 +419,9 @@ impl Client {
             if kind == BodyKind::Json {
                 let body = match body(&mut reader) {
                     Ok(body) => body,
+                    Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
                     Err(error) if attempt < max_attempts => {
-                        wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                        self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -326,8 +459,9 @@ impl Client {
                     }
                     return Ok(output_items);
                 }
+                Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                    self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -355,16 +489,23 @@ impl Client {
             }
             Ok(())
         };
-        let mut reader = std::io::BufReader::new(response.into_reader());
+        let mut reader = std::io::BufReader::new(self.body_reader(response));
         let kind = match body_kind(&content_type) {
             BodyKind::Unknown => sniff_body(&mut reader),
             kind => kind,
+        };
+        let interrupted = |error: String| {
+            if self.interrupted() {
+                INTERRUPTED.to_string()
+            } else {
+                error
+            }
         };
         if kind == BodyKind::Json {
             let mut body = String::new();
             reader
                 .read_to_string(&mut body)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| interrupted(error.to_string()))?;
             let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
             for item in json_items(protocol, &value).0 {
                 let delta = item_text(&item);
@@ -375,7 +516,7 @@ impl Client {
             }
             return Ok(text);
         }
-        read_sse(protocol, &mut reader, &mut accumulate)?;
+        read_sse(protocol, &mut reader, &mut accumulate).map_err(interrupted)?;
         release_connection(Box::new(reader));
         Ok(text)
     }
@@ -432,7 +573,7 @@ fn shared_agent(connect_timeout: Duration, read_timeout: Duration) -> ureq::Agen
 /// A stream parser stops at the protocol's last event, before the body's
 /// end; the connection goes back to the pool only once the body is read
 /// through. The rest (a chunk terminator) is read off the turn's path.
-fn release_connection(mut reader: Box<dyn Read + Send + Sync>) {
+fn release_connection(mut reader: Box<dyn Read + Send>) {
     thread::spawn(move || {
         let _ = std::io::copy(&mut (&mut reader).take(1 << 20), &mut std::io::sink());
     });
@@ -562,24 +703,100 @@ fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) 
     }
 }
 
-/// Announces the next attempt after failed attempt `attempt` and waits for
-/// it: the backoff, or the server's Retry-After when that is longer.
-fn wait_to_retry(
-    attempt: usize,
-    max_attempts: usize,
-    reason: &str,
-    retry_after: Option<Duration>,
-    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
-) -> Result<(), String> {
-    let delay = retry_delay(attempt, retry_after, jitter());
-    emit(StreamEvent::Retrying {
-        attempt: attempt + 1,
-        max_attempts,
-        reason: reason.to_string(),
-        delay_ms: delay.as_millis() as u64,
-    })?;
-    thread::sleep(delay);
-    Ok(())
+fn interrupted_request() -> RequestError {
+    RequestError {
+        status: None,
+        message: INTERRUPTED.to_string(),
+        retry_after: None,
+    }
+}
+
+/// A response body read on a thread of its own, a piece at a time, ahead of
+/// its parser: a read here waits for the next piece only as long as the
+/// interrupt flag is clear. Interrupted, the reading thread is left to its
+/// read (which ends with the connection's read timeout) and stops there.
+/// Dropped before the end, it stops at its next piece; the body's rest is
+/// read off by `release_connection` where the connection is to be kept.
+struct PumpedBody {
+    pieces: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    piece: Vec<u8>,
+    at: usize,
+    ended: bool,
+    interrupt: Arc<AtomicBool>,
+}
+
+impl PumpedBody {
+    fn start(
+        mut body: Box<dyn Read + Send + Sync>,
+        interrupt: Arc<AtomicBool>,
+    ) -> Box<dyn Read + Send> {
+        let (sender, pieces) = mpsc::sync_channel(BODY_PIECES_AHEAD);
+        // A thread that cannot start drops `sender`: the body then reads as
+        // ended early, a failure the request is retried after.
+        let _ = thread::Builder::new()
+            .name("llm-body".to_string())
+            .spawn(move || pump_body(&mut body, &sender));
+        Box::new(Self {
+            pieces,
+            piece: Vec::new(),
+            at: 0,
+            ended: false,
+            interrupt,
+        })
+    }
+}
+
+/// Reads `body` to its end into `sender`, a piece at a time; an empty piece
+/// marks the end. Stops when the reader is gone.
+fn pump_body(body: &mut impl Read, sender: &mpsc::SyncSender<std::io::Result<Vec<u8>>>) {
+    let mut buffer = vec![0u8; BODY_PIECE];
+    loop {
+        let piece = match body.read(&mut buffer) {
+            Ok(read) => Ok(buffer[..read].to_vec()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => Err(error),
+        };
+        let last = !matches!(&piece, Ok(bytes) if !bytes.is_empty());
+        if sender.send(piece).is_err() || last {
+            return;
+        }
+    }
+}
+
+impl Read for PumpedBody {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // Not ErrorKind::Interrupted: std's readers retry that one.
+            if self.interrupt.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other(INTERRUPTED));
+            }
+            if self.at < self.piece.len() {
+                let read = (self.piece.len() - self.at).min(out.len());
+                out[..read].copy_from_slice(&self.piece[self.at..self.at + read]);
+                self.at += read;
+                return Ok(read);
+            }
+            if self.ended {
+                return Ok(0);
+            }
+            match self.pieces.recv_timeout(INTERRUPT_POLL) {
+                Ok(Ok(piece)) if piece.is_empty() => self.ended = true,
+                Ok(Ok(piece)) => (self.piece, self.at) = (piece, 0),
+                Ok(Err(error)) => {
+                    self.ended = true;
+                    return Err(error);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.ended = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the response body ended early",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// A factor in [0.9, 1.1).
@@ -912,6 +1129,233 @@ mod tests {
                 .expect("stream succeeds");
             // The body's tail is read off the turn's path before the
             // connection is pooled again.
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(rx.recv().expect("one connection"), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "the second request opened a new connection"
+        );
+    }
+
+    /// A client whose requests `flag` stops, retrying once.
+    fn interruptible_client(flag: &Arc<AtomicBool>) -> Client {
+        let mut client = test_client();
+        client.set_interrupt(Arc::clone(flag));
+        client
+    }
+
+    /// Sets `flag` after `delay`, on a thread of its own.
+    fn raise_after(flag: &Arc<AtomicBool>, delay: Duration) {
+        let flag = Arc::clone(flag);
+        thread::spawn(move || {
+            thread::sleep(delay);
+            flag.store(true, Ordering::SeqCst);
+        });
+    }
+
+    /// A server that takes each request and then says nothing, the socket
+    /// left open: what a network that went quiet looks like from here.
+    /// `head`: written before it goes quiet. Counts the connections.
+    fn serve_then_go_quiet(head: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                count.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    let _ = read_request(&mut stream);
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.flush();
+                    thread::sleep(Duration::from_secs(60));
+                    drop(stream);
+                });
+            }
+        });
+        (base, accepted)
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_wait_before_a_retry_and_sends_nothing_more() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = read_request(&mut stream);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 30\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy",
+                );
+            }
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let client = interruptible_client(&flag);
+        let mut waiting_since = None;
+        let error = client
+            .stream(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(5),
+                &mut |event| {
+                    if let StreamEvent::Retrying { delay_ms, .. } = event {
+                        assert!(delay_ms >= 27_000, "Retry-After is honored: {delay_ms}");
+                        waiting_since = Some(Instant::now());
+                        raise_after(&flag, Duration::from_millis(100));
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("interrupted");
+        let waited = waiting_since.expect("a retry was announced").elapsed();
+        assert_eq!(error, INTERRUPTED);
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a request after the stop"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_ends_a_request_whose_answer_never_comes() {
+        let (base, accepted) = serve_then_go_quiet("");
+        let flag = Arc::new(AtomicBool::new(false));
+        let client = interruptible_client(&flag);
+        raise_after(&flag, Duration::from_millis(300));
+        let started = Instant::now();
+        let mut events = 0;
+        let error = client
+            .stream(
+                Protocol::OpenAiChatCompletions,
+                &format!("{base}/chat/completions"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(30),
+                &mut |_| {
+                    events += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("interrupted");
+        assert_eq!(error, INTERRUPTED);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(events, 0, "no retry and no connection announced");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_interrupt_ends_a_stream_that_stops_midway() {
+        let (base, _) = serve_then_go_quiet(concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "4f\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\r\n",
+        ));
+        let flag = Arc::new(AtomicBool::new(false));
+        let client = interruptible_client(&flag);
+        let mut deltas = Vec::new();
+        let mut stalled_since = None;
+        let error = client
+            .stream(
+                Protocol::OpenAiChatCompletions,
+                &format!("{base}/chat/completions"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(30),
+                &mut |event| {
+                    if let StreamEvent::Wire(WireEvent::Delta(delta)) = event {
+                        deltas.push(delta);
+                        stalled_since = Some(Instant::now());
+                        raise_after(&flag, Duration::from_millis(200));
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("interrupted");
+        assert_eq!(error, INTERRUPTED);
+        assert_eq!(deltas, ["hi"]);
+        let stalled = stalled_since.expect("the delta came").elapsed();
+        assert!(stalled < Duration::from_secs(2), "took {stalled:?}");
+    }
+
+    #[test]
+    fn read_text_ends_when_interrupted_mid_body() {
+        let (base, _) = serve_then_go_quiet(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let client = interruptible_client(&flag);
+        let response = client
+            .send_with_retry(
+                Protocol::OpenAiChatCompletions,
+                &format!("{base}/chat/completions"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(30),
+                &mut |_| Ok(()),
+            )
+            .expect("the head came");
+        raise_after(&flag, Duration::from_millis(200));
+        let started = Instant::now();
+        let error = client
+            .read_text(response, Protocol::OpenAiChatCompletions, &mut |_| Ok(()))
+            .expect_err("interrupted");
+        assert_eq!(error, INTERRUPTED);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// With a flag that is never raised, a stream reads as before and its
+    /// connection still goes back to the pool.
+    #[test]
+    fn an_interruptible_client_still_reuses_its_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut accepted = 0;
+            while let Ok((mut stream, _)) = listener.accept() {
+                accepted += 1;
+                let _ = tx.send(accepted);
+                while read_request(&mut stream).is_ok_and(|request| !request.is_empty()) {
+                    let event = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n0\r\n\r\n",
+                        event.len()
+                    );
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let flag = Arc::new(AtomicBool::new(false));
+        let client = interruptible_client(&flag);
+        for _ in 0..2 {
+            let mut deltas = Vec::new();
+            client
+                .stream(
+                    Protocol::OpenAiResponses,
+                    &format!("{base}/responses"),
+                    &serde_json::json!({ "model": "test" }),
+                    Duration::from_secs(5),
+                    &mut |event| {
+                        if let StreamEvent::Wire(WireEvent::Delta(delta)) = event {
+                            deltas.push(delta);
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("stream succeeds");
+            assert_eq!(deltas, ["ok"]);
             thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(rx.recv().expect("one connection"), 1);
