@@ -31,6 +31,9 @@ pub struct ResponsesRequest<'a> {
     pub model: &'a str,
     pub instructions: &'a str,
     pub prompt_cache_key: &'a str,
+    /// "" for a model that does not reason: the request carries no
+    /// `reasoning` and asks for no encrypted reasoning (such models reject
+    /// both).
     pub reasoning_effort: &'a str,
     /// Conversation items in canonical Responses form.
     pub input: Vec<Value>,
@@ -42,26 +45,27 @@ pub struct ResponsesRequest<'a> {
 /// Builds a streaming Responses body. Encrypted reasoning is requested so
 /// multi-turn tool calls can replay it under `store: false`.
 pub fn request_body(request: ResponsesRequest<'_>) -> Value {
-    // A reasoning summary makes the thinking phase stream visible; with effort
-    // "none" the model does not reason, so none is requested.
-    let reasoning = if request.reasoning_effort == "none" {
-        json!({ "effort": request.reasoning_effort })
-    } else {
-        json!({ "effort": request.reasoning_effort, "summary": "auto" })
-    };
     let mut body = json!({
         "model": request.model,
         "instructions": request.instructions,
         "prompt_cache_key": request.prompt_cache_key,
-        "reasoning": reasoning,
         "input": sanitize_input(request.input),
         "tools": request.tools,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "store": false,
-        "include": ["reasoning.encrypted_content"],
         "stream": true
     });
+    // A reasoning summary makes the thinking phase stream visible; with effort
+    // "none" the model does not reason, so none is requested.
+    match request.reasoning_effort {
+        "" => {}
+        "none" => body["reasoning"] = json!({ "effort": "none" }),
+        effort => body["reasoning"] = json!({ "effort": effort, "summary": "auto" }),
+    }
+    if !request.reasoning_effort.is_empty() {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
     set_max_output_tokens(&mut body, request.max_output_tokens);
     body
 }
@@ -75,7 +79,8 @@ fn set_max_output_tokens(body: &mut Value, max_output_tokens: u64) {
 }
 
 /// Body for a one-shot call (summarization, safety classification): no tools,
-/// no cache key, and no reasoning summary.
+/// no cache key, and no reasoning summary. An empty `reasoning_effort` (a
+/// model that does not reason) sends no `reasoning`.
 pub fn one_shot_body(
     model: &str,
     instructions: &str,
@@ -86,11 +91,13 @@ pub fn one_shot_body(
     let mut body = json!({
         "model": model,
         "instructions": instructions,
-        "reasoning": { "effort": reasoning_effort },
         "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
         "store": false,
         "stream": true
     });
+    if !reasoning_effort.is_empty() {
+        body["reasoning"] = json!({ "effort": reasoning_effort });
+    }
     set_max_output_tokens(&mut body, max_output_tokens);
     body
 }
@@ -623,6 +630,25 @@ mod tests {
         });
 
         assert_eq!(body["reasoning"], json!({ "effort": "none" }));
+    }
+
+    #[test]
+    fn a_model_that_does_not_reason_gets_no_reasoning_fields() {
+        let body = request_body(ResponsesRequest {
+            model: "gpt-4.1",
+            instructions: "system",
+            prompt_cache_key: "cache-key",
+            reasoning_effort: "",
+            input: Vec::new(),
+            tools: &[],
+            max_output_tokens: 2048,
+        });
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("include").is_none());
+        assert_eq!(body["store"], false);
+        assert!(one_shot_body("gpt-4.1", "sys", "", "user", 0)
+            .get("reasoning")
+            .is_none());
     }
 
     #[test]

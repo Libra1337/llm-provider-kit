@@ -57,6 +57,8 @@ pub struct AnthropicRequest<'a> {
     /// Tool declarations in [`tool_definitions`] form.
     pub tools: &'a [Value],
     pub max_output_tokens: u64,
+    /// "" for a model that does not reason: no `thinking` and no
+    /// `output_config`.
     pub reasoning_effort: &'a str,
 }
 
@@ -107,7 +109,7 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
         "tool_choice": { "type": "auto" },
         "stream": true
     });
-    if adaptive {
+    if adaptive && !effort.is_empty() {
         if thinks {
             body["thinking"] = json!({ "type": "adaptive" });
             body["output_config"] = json!({ "effort": effort });
@@ -1064,6 +1066,24 @@ mod tests {
         });
         assert!(none.get("thinking").is_none());
         assert_eq!(none["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn a_model_that_does_not_reason_gets_no_thinking_settings() {
+        for model in ["claude-opus-5-5", "claude-haiku-4-5", "glm-5"] {
+            let body = request_body(&AnthropicRequest {
+                model,
+                system_prompt: "system",
+                stable_system_len: None,
+                input: &[],
+                tools: &[],
+                max_output_tokens: 8_192,
+                reasoning_effort: "",
+            });
+            assert!(body.get("thinking").is_none(), "{model}");
+            assert!(body.get("output_config").is_none(), "{model}");
+            assert_eq!(body["max_tokens"], 8_192, "{model}");
+        }
     }
 
     #[test]
