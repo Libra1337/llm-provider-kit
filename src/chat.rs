@@ -25,7 +25,8 @@ pub struct ChatRequest<'a> {
     /// Responses-style tool definitions; converted to the nested chat format.
     pub tools: &'a [Value],
     pub max_output_tokens: u64,
-    /// "" omits the field (the model's default). "none" is sent as is: models
+    /// "" omits the field (the model's default, or a model that does not
+    /// reason). "none" is sent as is: models
     /// that think by default (DeepSeek, GLM) otherwise keep thinking.
     pub reasoning_effort: &'a str,
 }
