@@ -386,10 +386,12 @@ fn sanitize_input_item(mut item: Value) -> Option<Value> {
     // Response item ids are service-owned metadata. Replaying them makes the
     // request prefix less stable and differs from Codex, which does not
     // serialize ids back into Responses input. is_error is a local annotation
-    // for the Anthropic conversion; the Responses API rejects unknown fields.
+    // for the Anthropic conversion, reasoning_content the thinking a Chat
+    // Completions answer came with; the Responses API rejects unknown fields.
     if let Value::Object(map) = &mut item {
         map.remove("id");
         map.remove("is_error");
+        map.remove("reasoning_content");
     }
     Some(item)
 }
@@ -578,6 +580,20 @@ mod tests {
         assert_eq!(sanitized.len(), 1);
         assert!(sanitized[0].get("is_error").is_none());
         assert_eq!(sanitized[0]["output"], "boom");
+    }
+
+    #[test]
+    fn sanitizer_strips_chat_reasoning_content() {
+        let sanitized = sanitize_input(vec![json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{}",
+            "reasoning_content": "check the file first"
+        })]);
+
+        assert!(sanitized[0].get("reasoning_content").is_none());
+        assert_eq!(sanitized[0]["name"], "read");
     }
 
     #[test]

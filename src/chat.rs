@@ -25,17 +25,19 @@ pub struct ChatRequest<'a> {
     /// Responses-style tool definitions; converted to the nested chat format.
     pub tools: &'a [Value],
     pub max_output_tokens: u64,
-    /// "" omits the field (the model's default, or a model that does not
-    /// reason). "none" is sent as is: models
-    /// that think by default (DeepSeek, GLM) otherwise keep thinking.
+    /// "" or [`DEFAULT_EFFORT`] sends no thinking setting (the provider's
+    /// default, or a model that does not reason). "none" turns thinking off
+    /// and any other effort turns it on, in the form `thinking` says.
     pub reasoning_effort: &'a str,
+    /// How the endpoint takes thinking settings (see [`thinking_for`]).
+    pub thinking: ChatThinking,
 }
 
 /// Builds a streaming Chat Completions request body.
 pub fn request_body(request: &ChatRequest<'_>) -> Value {
     let mut body = json!({
         "model": request.model,
-        "messages": messages_from_input(request.system_prompt, request.input),
+        "messages": messages(request.system_prompt, request.input, request.thinking.replay),
         "stream": true,
         "stream_options": { "include_usage": true }
     });
@@ -49,16 +51,254 @@ pub fn request_body(request: &ChatRequest<'_>) -> Value {
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if !request.reasoning_effort.is_empty() {
-        body["reasoning_effort"] = json!(request.reasoning_effort);
-    }
+    set_thinking(&mut body, request.thinking.param, request.reasoning_effort);
     body
+}
+
+/// The effort that sends no thinking setting: the provider's own default.
+/// [`reasoning_efforts`] lists it for every reasoning model.
+pub const DEFAULT_EFFORT: &str = "default";
+
+/// How a Chat Completions endpoint takes thinking settings. OpenAI-compatible
+/// servers disagree here, and a field a server does not know can be a 400.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingParam {
+    /// `reasoning_effort: "<effort>"`, OpenAI's field.
+    #[default]
+    ReasoningEffort,
+    /// OpenRouter's `reasoning: {"effort": …}`; `{"enabled": false}` for none.
+    OpenRouter,
+    /// `thinking: {"type": "enabled" | "disabled"}` (GLM, Kimi K2, MiMo).
+    ThinkingType,
+    /// `thinking` as above, plus `reasoning_effort` while thinking (DeepSeek).
+    ThinkingAndEffort,
+    /// `enable_thinking: true | false` (Alibaba Model Studio).
+    EnableThinking,
+}
+
+/// What a Chat Completions endpoint wants for a model's thinking.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatThinking {
+    pub param: ThinkingParam,
+    /// Assistant messages carry their `reasoning_content` back ("" for one
+    /// that did not think). DeepSeek, Kimi and MiMo answer 400 without it
+    /// once tools are in play; other servers may reject the unknown field,
+    /// so it is sent only where documented.
+    pub replay: bool,
+}
+
+/// Adds the thinking setting for `effort` to a request body.
+fn set_thinking(body: &mut Value, param: ThinkingParam, effort: &str) {
+    if effort.is_empty() || effort == DEFAULT_EFFORT {
+        return;
+    }
+    let on = effort != "none";
+    let kind = if on { "enabled" } else { "disabled" };
+    let thinking = json!({ "type": kind });
+    match param {
+        ThinkingParam::ReasoningEffort => body["reasoning_effort"] = json!(effort),
+        ThinkingParam::OpenRouter if on => body["reasoning"] = json!({ "effort": effort }),
+        ThinkingParam::OpenRouter => body["reasoning"] = json!({ "enabled": false }),
+        ThinkingParam::ThinkingType => body["thinking"] = thinking,
+        ThinkingParam::ThinkingAndEffort => {
+            body["thinking"] = thinking;
+            if on {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
+        ThinkingParam::EnableThinking => body["enable_thinking"] = json!(on),
+    }
+}
+
+/// Endpoint families whose thinking settings are documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vendor {
+    OpenRouter,
+    DeepSeek,
+    /// Moonshot's platform API (api.moonshot.ai / .cn).
+    Moonshot,
+    /// The Kimi Code plan (api.kimi.com/coding/v1).
+    KimiCode,
+    /// Zhipu / Z.ai GLM, including the coding plan.
+    Zhipu,
+    Xiaomi,
+    /// Alibaba Model Studio (DashScope), including the coding and token plans.
+    Alibaba,
+    Other,
+}
+
+fn vendor(base_url: &str) -> Vendor {
+    let host = url_host(base_url);
+    let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    if on("openrouter.ai") {
+        Vendor::OpenRouter
+    } else if on("deepseek.com") {
+        Vendor::DeepSeek
+    } else if on("kimi.com") || on("kimi.ai") {
+        if base_url.contains("/coding") {
+            Vendor::KimiCode
+        } else {
+            Vendor::Moonshot
+        }
+    } else if on("moonshot.ai") || on("moonshot.cn") {
+        Vendor::Moonshot
+    } else if on("bigmodel.cn") || on("z.ai") {
+        Vendor::Zhipu
+    } else if on("xiaomimimo.com") {
+        Vendor::Xiaomi
+    } else if on("aliyuncs.com") && (host.contains("dashscope") || host.contains("maas")) {
+        Vendor::Alibaba
+    } else {
+        Vendor::Other
+    }
+}
+
+/// The lowercase host of a URL, without user info or port.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    host.split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+/// GLM's version from a model id: "glm-5.2-highspeed" → (5, 2), "glm-5v" → (5, 0).
+fn glm_version(model: &str) -> Option<(u32, u32)> {
+    let (major, rest) = leading_number(&model[model.find("glm-")? + 4..]);
+    let minor = rest
+        .strip_prefix('.')
+        .and_then(|rest| leading_number(rest).0)
+        .unwrap_or(0);
+    Some((major?, minor))
+}
+
+/// The number `text` starts with, and the rest.
+fn leading_number(text: &str) -> (Option<u32>, &str) {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    (text[..end].parse().ok(), &text[end..])
+}
+
+/// Models that cannot stop thinking: "none" is a 400 on them (Fireworks,
+/// OpenRouter's mandatory-reasoning models, Model Studio).
+fn always_thinks(model: &str) -> bool {
+    ["thinking", "deepseek-r1", "qwq", "minimax-m2", "gpt-oss"]
+        .iter()
+        .any(|family| model.contains(family))
+}
+
+fn is_kimi_k3(model: &str) -> bool {
+    model.starts_with("kimi-k3") || model.starts_with("k3")
+}
+
+/// How the endpoint at `base_url` takes thinking settings for `model`.
+pub fn thinking_for(base_url: &str, model: &str) -> ChatThinking {
+    let model = model.to_ascii_lowercase();
+    let vendor = vendor(base_url);
+    let param = match vendor {
+        Vendor::OpenRouter => ThinkingParam::OpenRouter,
+        Vendor::DeepSeek => ThinkingParam::ThinkingAndEffort,
+        // K3 takes only `reasoning_effort` (docs: do not send `thinking`).
+        Vendor::Moonshot if is_kimi_k3(&model) => ThinkingParam::ReasoningEffort,
+        Vendor::Moonshot | Vendor::Xiaomi => ThinkingParam::ThinkingType,
+        // The Kimi Code plan maps `reasoning_effort`; "none" is thinking off.
+        Vendor::KimiCode => ThinkingParam::ReasoningEffort,
+        // GLM-5.2 and newer take `reasoning_effort`, and 5.3 rejects
+        // `thinking: disabled`.
+        Vendor::Zhipu if glm_version(&model).is_some_and(|v| v >= (5, 2)) => {
+            ThinkingParam::ReasoningEffort
+        }
+        Vendor::Zhipu => ThinkingParam::ThinkingType,
+        Vendor::Alibaba => ThinkingParam::EnableThinking,
+        Vendor::Other => ThinkingParam::ReasoningEffort,
+    };
+    // GLM's coding plan keeps earlier thinking, and DeepSeek, Kimi and MiMo
+    // models check it wherever they are served.
+    let replay = matches!(
+        vendor,
+        Vendor::DeepSeek | Vendor::Moonshot | Vendor::KimiCode | Vendor::Zhipu | Vendor::Xiaomi
+    ) || ["deepseek", "kimi", "mimo"]
+        .iter()
+        .any(|family| model.contains(family));
+    ChatThinking { param, replay }
+}
+
+const DEFAULT_ONLY: &[&str] = &[DEFAULT_EFFORT];
+const ON_OFF: &[&str] = &[DEFAULT_EFFORT, "none"];
+const OPENROUTER_EFFORTS: &[&str] = &[DEFAULT_EFFORT, "none", "low", "medium", "high", "xhigh"];
+const OPENROUTER_ALWAYS: &[&str] = &[DEFAULT_EFFORT, "low", "medium", "high", "xhigh"];
+/// DeepSeek V4 and the Kimi Code plan: off, or low / high / max.
+const OFF_LOW_HIGH_MAX: &[&str] = &[DEFAULT_EFFORT, "none", "low", "high", "max"];
+/// Kimi K3 and GLM-5.3: always thinking, at low / high / max.
+const LOW_HIGH_MAX: &[&str] = &[DEFAULT_EFFORT, "low", "high", "max"];
+/// GLM-5.2: "none" skips thinking; low and medium act as high.
+const GLM_5_2: &[&str] = &[DEFAULT_EFFORT, "none", "high", "max"];
+const GPT_OSS: &[&str] = &[DEFAULT_EFFORT, "low", "medium", "high"];
+
+/// Effort tiers for a model the catalog marks as reasoning, served over
+/// Chat Completions at `base_url`. [`DEFAULT_EFFORT`] comes first: it sends
+/// nothing, so the provider's default applies. Other tiers are offered only
+/// where the provider documents them; an unknown endpoint or model gets the
+/// default alone, as a server can reject a setting it does not know.
+pub fn reasoning_efforts(base_url: &str, model: &str) -> &'static [&'static str] {
+    let model = model.to_ascii_lowercase();
+    let always = always_thinks(&model);
+    match vendor(base_url) {
+        // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+        Vendor::OpenRouter if always => OPENROUTER_ALWAYS,
+        Vendor::OpenRouter => OPENROUTER_EFFORTS,
+        // https://api-docs.deepseek.com/guides/thinking_mode
+        Vendor::DeepSeek => OFF_LOW_HIGH_MAX,
+        // https://platform.kimi.ai/docs/api/models-overview: K3 always
+        // thinks; K2.7 Code rejects `disabled` and takes no effort.
+        Vendor::Moonshot if is_kimi_k3(&model) => LOW_HIGH_MAX,
+        Vendor::Moonshot if model.starts_with("kimi-k2.5") || model.starts_with("kimi-k2.6") => {
+            ON_OFF
+        }
+        Vendor::Moonshot => DEFAULT_ONLY,
+        // https://www.kimi.com/code/docs/en/kimi-code/models.html
+        Vendor::KimiCode if is_kimi_k3(&model) => LOW_HIGH_MAX,
+        Vendor::KimiCode if model == "kimi-for-coding" => OFF_LOW_HIGH_MAX,
+        Vendor::KimiCode => DEFAULT_ONLY,
+        // https://docs.z.ai/guides/capabilities/thinking
+        Vendor::Zhipu => match glm_version(&model) {
+            Some(version) if version >= (5, 3) => LOW_HIGH_MAX,
+            Some((5, 2)) => GLM_5_2,
+            Some(_) => ON_OFF,
+            None => DEFAULT_ONLY,
+        },
+        Vendor::Xiaomi => ON_OFF,
+        // https://www.alibabacloud.com/help/en/model-studio/deep-thinking:
+        // thinking-only models answer 400 to `enable_thinking: false`.
+        Vendor::Alibaba
+            if always
+                || model.contains("max-preview")
+                || glm_version(&model).is_some_and(|v| v >= (5, 3)) =>
+        {
+            DEFAULT_ONLY
+        }
+        Vendor::Alibaba => ON_OFF,
+        // gpt-oss takes low / medium / high wherever it runs.
+        Vendor::Other if model.contains("gpt-oss") => GPT_OSS,
+        Vendor::Other => DEFAULT_ONLY,
+    }
 }
 
 /// Converts Responses-style input items into Chat Completions messages.
 /// Reasoning/thinking items are not replayable over this protocol and are
 /// dropped.
 pub fn messages_from_input(system_prompt: &str, input: &[Value]) -> Vec<Value> {
+    messages(system_prompt, input, false)
+}
+
+/// [`messages_from_input`], with `reasoning_content` on the assistant
+/// messages that had it when `replay` is set.
+fn messages(system_prompt: &str, input: &[Value], replay: bool) -> Vec<Value> {
     let mut messages = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(json!({ "role": "system", "content": system_prompt }));
@@ -72,7 +312,11 @@ pub fn messages_from_input(system_prompt: &str, input: &[Value]) -> Vec<Value> {
             "message" => {
                 let text = response_content_text(item, "output_text");
                 if !text.is_empty() {
-                    messages.push(json!({ "role": "assistant", "content": text }));
+                    let mut message = json!({ "role": "assistant", "content": text });
+                    if let Some(reasoning) = replayed_reasoning(item, replay) {
+                        message["reasoning_content"] = json!(reasoning);
+                    }
+                    messages.push(message);
                 }
             }
             "function_call" => {
@@ -93,7 +337,12 @@ pub fn messages_from_input(system_prompt: &str, input: &[Value]) -> Vec<Value> {
                     "type": "function",
                     "function": { "name": name, "arguments": normalized_arguments(arguments) }
                 });
-                push_tool_call(&mut messages, call);
+                push_tool_call(
+                    &mut messages,
+                    call,
+                    replayed_reasoning(item, replay),
+                    replay,
+                );
             }
             "function_call_output" => {
                 let id = item
@@ -114,6 +363,15 @@ pub fn messages_from_input(system_prompt: &str, input: &[Value]) -> Vec<Value> {
                 }));
             }
             _ => {}
+        }
+    }
+    // DeepSeek rejects a tool-bearing history in which any assistant message
+    // lacks the field, also one that did not think: those send it empty.
+    if replay {
+        for message in &mut messages {
+            if message["role"] == "assistant" && message.get("reasoning_content").is_none() {
+                message["reasoning_content"] = json!("");
+            }
         }
     }
     messages
@@ -145,18 +403,46 @@ fn user_message(item: &Value) -> Value {
     json!({ "role": "user", "content": parts })
 }
 
+/// The reasoning a chat answer came with (`reasoning_content` on its first
+/// item, see `state_to_items`), when it is to be sent back.
+fn replayed_reasoning(item: &Value, replay: bool) -> Option<&str> {
+    item.get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|reasoning| replay && !reasoning.is_empty())
+}
+
 /// Parallel calls arrive as consecutive `function_call` items; the chat format
 /// wants them merged into a single assistant message's `tool_calls` array.
-fn push_tool_call(messages: &mut Vec<Value>, call: Value) {
+/// With `with_text`, calls also join the answer text just before them: one
+/// message per answer, as servers that check replayed reasoning expect.
+fn push_tool_call(
+    messages: &mut Vec<Value>,
+    call: Value,
+    reasoning: Option<&str>,
+    with_text: bool,
+) {
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             if let Some(calls) = last.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 calls.push(call);
                 return;
             }
+            if with_text {
+                last["tool_calls"] = json!([call]);
+                if let Some(reasoning) =
+                    reasoning.filter(|_| last.get("reasoning_content").is_none())
+                {
+                    last["reasoning_content"] = json!(reasoning);
+                }
+                return;
+            }
         }
     }
-    messages.push(json!({ "role": "assistant", "content": Value::Null, "tool_calls": [call] }));
+    let mut message = json!({ "role": "assistant", "content": Value::Null, "tool_calls": [call] });
+    if let Some(reasoning) = reasoning {
+        message["reasoning_content"] = json!(reasoning);
+    }
+    messages.push(message);
 }
 
 /// Converts Responses-style flat tool definitions into the nested chat format.
@@ -183,6 +469,8 @@ pub fn tools_from_definitions(definitions: &[Value]) -> Vec<Value> {
 #[derive(Default)]
 struct StreamState {
     text: String,
+    /// The answer's thinking, kept for servers that want it back.
+    reasoning: String,
     think: ThinkSplitter,
     tool_calls: BTreeMap<u64, ToolCall>,
     usage: Option<Usage>,
@@ -307,10 +595,12 @@ fn strip_think(content: &str) -> &str {
 fn emit_content_parts(
     parts: Vec<ContentPart>,
     state_text: &mut String,
+    state_reasoning: &mut String,
     emit: &mut impl FnMut(WireEvent) -> Result<(), String>,
 ) -> Result<(), String> {
     for (reasoning, text) in parts {
         if reasoning {
+            state_reasoning.push_str(&text);
             emit(WireEvent::ReasoningDelta(text))?;
         } else {
             state_text.push_str(&text);
@@ -349,7 +639,7 @@ pub fn read_sse_stream(
         return Err("stream closed before finish_reason".to_string());
     }
     let held = state.think.finish();
-    emit_content_parts(held, &mut state.text, &mut emit)?;
+    emit_content_parts(held, &mut state.text, &mut state.reasoning, &mut emit)?;
 
     let items = state_to_items(state, &mut emit)?;
     Ok(items)
@@ -384,7 +674,7 @@ fn handle_sse_data(
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
         if !content.is_empty() {
             let parts = state.think.push(content);
-            emit_content_parts(parts, &mut state.text, emit)?;
+            emit_content_parts(parts, &mut state.text, &mut state.reasoning, emit)?;
         }
     }
     // DeepSeek-style `reasoning_content` and OpenRouter-style `reasoning`
@@ -396,6 +686,7 @@ fn handle_sse_data(
         .and_then(Value::as_str)
     {
         if !reasoning.is_empty() {
+            state.reasoning.push_str(reasoning);
             emit(WireEvent::ReasoningDelta(reasoning.to_string()))?;
         }
     } else {
@@ -411,6 +702,7 @@ fn handle_sse_data(
                 _ => None,
             };
             if let Some(text) = text.and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                state.reasoning.push_str(text);
                 emit(WireEvent::ReasoningDelta(text.to_string()))?;
             }
         }
@@ -476,6 +768,11 @@ fn state_to_items(
             "arguments": arguments
         }));
     }
+    // The thinking rides on the answer's first item, where `messages` finds
+    // it to send back (DeepSeek and others require that with tools).
+    if let Some(first) = items.first_mut().filter(|_| !state.reasoning.is_empty()) {
+        first["reasoning_content"] = json!(state.reasoning);
+    }
     for item in &items {
         emit(WireEvent::ResponseItem(item.clone()))?;
     }
@@ -523,6 +820,14 @@ pub fn completion_to_items(value: &Value) -> (Vec<Value>, Option<Usage>) {
                     function.get("arguments").and_then(Value::as_str).unwrap_or_default()
                 )
             }));
+        }
+        let reasoning = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|reasoning| !reasoning.is_empty());
+        if let (Some(reasoning), Some(first)) = (reasoning, items.first_mut()) {
+            first["reasoning_content"] = json!(reasoning);
         }
     }
     let usage = value.get("usage").map(usage_from_value);
@@ -922,6 +1227,7 @@ mod tests {
             tools: &tools,
             max_output_tokens: 2048,
             reasoning_effort: "",
+            thinking: ChatThinking::default(),
         };
         let body = request_body(&request);
 
@@ -947,6 +1253,304 @@ mod tests {
         let body = request_body(&request);
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("tools").is_none());
+
+        // "default" leaves the provider's own setting.
+        let body = request_body(&ChatRequest {
+            reasoning_effort: DEFAULT_EFFORT,
+            ..request
+        });
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// The thinking fields of a request body for `base_url` and `model` at `effort`.
+    fn thinking_fields(base_url: &str, model: &str, effort: &str) -> Value {
+        let body = request_body(&ChatRequest {
+            model,
+            system_prompt: "",
+            input: &[],
+            tools: &[],
+            max_output_tokens: 0,
+            reasoning_effort: effort,
+            thinking: thinking_for(base_url, model),
+        });
+        let mut fields = serde_json::Map::new();
+        for key in [
+            "reasoning_effort",
+            "reasoning",
+            "thinking",
+            "enable_thinking",
+        ] {
+            if let Some(value) = body.get(key) {
+                fields.insert(key.to_string(), value.clone());
+            }
+        }
+        Value::Object(fields)
+    }
+
+    #[test]
+    fn each_family_gets_its_own_thinking_fields() {
+        let deepseek = "https://api.deepseek.com";
+        assert_eq!(thinking_fields(deepseek, "deepseek-v4-pro", ""), json!({}));
+        assert_eq!(
+            thinking_fields(deepseek, "deepseek-v4-pro", "default"),
+            json!({})
+        );
+        assert_eq!(
+            thinking_fields(deepseek, "deepseek-v4-pro", "none"),
+            json!({ "thinking": { "type": "disabled" } })
+        );
+        assert_eq!(
+            thinking_fields(deepseek, "deepseek-v4-pro", "max"),
+            json!({ "thinking": { "type": "enabled" }, "reasoning_effort": "max" })
+        );
+
+        let openrouter = "https://openrouter.ai/api/v1";
+        assert_eq!(
+            thinking_fields(openrouter, "z-ai/glm-5.2", "default"),
+            json!({})
+        );
+        assert_eq!(
+            thinking_fields(openrouter, "z-ai/glm-5.2", "none"),
+            json!({ "reasoning": { "enabled": false } })
+        );
+        assert_eq!(
+            thinking_fields(openrouter, "z-ai/glm-5.2", "high"),
+            json!({ "reasoning": { "effort": "high" } })
+        );
+
+        let glm = "https://open.bigmodel.cn/api/coding/paas/v4";
+        assert_eq!(
+            thinking_fields(glm, "glm-4.7", "none"),
+            json!({ "thinking": { "type": "disabled" } })
+        );
+        assert_eq!(
+            thinking_fields(glm, "glm-4.7", "high"),
+            json!({ "thinking": { "type": "enabled" } })
+        );
+        assert_eq!(
+            thinking_fields(glm, "glm-5.3", "low"),
+            json!({ "reasoning_effort": "low" })
+        );
+
+        let kimi = "https://api.moonshot.ai/v1";
+        assert_eq!(
+            thinking_fields(kimi, "kimi-k2.6", "none"),
+            json!({ "thinking": { "type": "disabled" } })
+        );
+        assert_eq!(
+            thinking_fields(kimi, "kimi-k3", "high"),
+            json!({ "reasoning_effort": "high" })
+        );
+        assert_eq!(
+            thinking_fields("https://api.kimi.com/coding/v1", "kimi-for-coding", "none"),
+            json!({ "reasoning_effort": "none" })
+        );
+
+        assert_eq!(
+            thinking_fields("https://api.xiaomimimo.com/v1", "mimo-v2.5-pro", "none"),
+            json!({ "thinking": { "type": "disabled" } })
+        );
+
+        let qwen = "https://coding-intl.dashscope.aliyuncs.com/v1";
+        assert_eq!(
+            thinking_fields(qwen, "qwen3.6-plus", "none"),
+            json!({ "enable_thinking": false })
+        );
+        assert_eq!(
+            thinking_fields(qwen, "qwen3.6-plus", "high"),
+            json!({ "enable_thinking": true })
+        );
+        assert_eq!(thinking_fields(qwen, "qwen3.6-plus", "default"), json!({}));
+
+        // Anything else: OpenAI's field, as a custom provider's tiers always sent.
+        let relay = "https://relay.example.com/v1";
+        assert_eq!(
+            thinking_fields(relay, "my-model", "none"),
+            json!({ "reasoning_effort": "none" })
+        );
+        assert_eq!(thinking_fields(relay, "my-model", "default"), json!({}));
+    }
+
+    #[test]
+    fn efforts_are_offered_only_where_documented() {
+        let efforts = reasoning_efforts;
+        assert_eq!(
+            efforts("https://api.deepseek.com", "deepseek-v4-flash"),
+            ["default", "none", "low", "high", "max"]
+        );
+        assert_eq!(
+            efforts("https://openrouter.ai/api/v1", "moonshotai/kimi-k2.6"),
+            ["default", "none", "low", "medium", "high", "xhigh"]
+        );
+        // OpenRouter answers 400 to "none" on models that always think.
+        assert_eq!(
+            efforts(
+                "https://openrouter.ai/api/v1",
+                "moonshotai/kimi-k2-thinking"
+            ),
+            ["default", "low", "medium", "high", "xhigh"]
+        );
+        let kimi = "https://api.moonshot.ai/v1";
+        assert_eq!(efforts(kimi, "kimi-k2.6"), ["default", "none"]);
+        assert_eq!(efforts(kimi, "kimi-k3"), ["default", "low", "high", "max"]);
+        assert_eq!(efforts(kimi, "kimi-k2-thinking"), ["default"]);
+        assert_eq!(efforts(kimi, "kimi-k2.7-code"), ["default"]);
+        let kimi_code = "https://api.kimi.com/coding/v1";
+        assert_eq!(efforts(kimi_code, "k3"), ["default", "low", "high", "max"]);
+        assert_eq!(
+            efforts(kimi_code, "kimi-for-coding"),
+            ["default", "none", "low", "high", "max"]
+        );
+        assert_eq!(efforts(kimi_code, "kimi-for-coding-highspeed"), ["default"]);
+        let glm = "https://open.bigmodel.cn/api/coding/paas/v4";
+        assert_eq!(efforts(glm, "glm-4.6"), ["default", "none"]);
+        assert_eq!(
+            efforts(glm, "glm-5.2-highspeed[1m]"),
+            ["default", "none", "high", "max"]
+        );
+        assert_eq!(
+            efforts(glm, "glm-5.3-flash"),
+            ["default", "low", "high", "max"]
+        );
+        assert_eq!(
+            efforts("https://api.xiaomimimo.com/v1", "mimo-v2.5"),
+            ["default", "none"]
+        );
+        let qwen = "https://coding-intl.dashscope.aliyuncs.com/v1";
+        assert_eq!(efforts(qwen, "qwen3.6-plus"), ["default", "none"]);
+        assert_eq!(efforts(qwen, "MiniMax-M2.5"), ["default"]);
+        assert_eq!(efforts(qwen, "glm-5.3"), ["default"]);
+        // MiniMax, Groq's R1 distill, an aggregator: the provider's default only.
+        assert_eq!(
+            efforts("https://api.minimax.io/v1", "MiniMax-M2.7"),
+            ["default"]
+        );
+        assert_eq!(
+            efforts(
+                "https://api.groq.com/openai/v1",
+                "deepseek-r1-distill-llama-70b"
+            ),
+            ["default"]
+        );
+        assert_eq!(
+            efforts("https://api.together.xyz/v1", "deepseek-ai/DeepSeek-V4-Pro"),
+            ["default"]
+        );
+        assert_eq!(
+            efforts("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+            ["default", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn endpoints_are_told_apart_by_host() {
+        assert_eq!(
+            url_host("https://User@API.DeepSeek.com:443/v1?x=1"),
+            "api.deepseek.com"
+        );
+        assert_eq!(vendor("https://api.deepseek.com"), Vendor::DeepSeek);
+        assert_eq!(
+            vendor("https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"),
+            Vendor::Alibaba
+        );
+        assert_eq!(vendor("https://api.z.ai/api/paas/v4"), Vendor::Zhipu);
+        assert_eq!(vendor("https://api.kimi.com/coding/v1"), Vendor::KimiCode);
+        // A look-alike domain is not the vendor.
+        assert_eq!(vendor("https://notdeepseek.com/v1"), Vendor::Other);
+        assert_eq!(vendor("http://127.0.0.1:11434/v1"), Vendor::Other);
+        assert_eq!(glm_version("glm-5v-turbo"), Some((5, 0)));
+        assert_eq!(glm_version("zai-org/glm-4.6v"), Some((4, 6)));
+        assert_eq!(glm_version("qwen3.6-plus"), None);
+    }
+
+    #[test]
+    fn streamed_reasoning_rides_on_the_first_item() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"read it \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"first\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let items = read_sse_stream(sse.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["reasoning_content"], "read it first");
+
+        let (items, _) = completion_to_items(&json!({
+            "choices": [{ "message": { "content": "ok", "reasoning_content": "thought" } }]
+        }));
+        assert_eq!(items[0]["reasoning_content"], "thought");
+    }
+
+    #[test]
+    fn reasoning_goes_back_only_where_the_server_wants_it() {
+        let input = vec![
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "go" }] }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "looking" }],
+                "reasoning_content": "check Cargo.toml"
+            }),
+            json!({ "type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "ls",
+                "arguments": "{}",
+                "reasoning_content": "now list"
+            }),
+            json!({ "type": "function_call_output", "call_id": "call_2", "output": "ok" }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "done, without thinking" }]
+            }),
+        ];
+        let body = |base_url: &str| {
+            request_body(&ChatRequest {
+                model: "deepseek-v4-pro",
+                system_prompt: "",
+                input: &input,
+                tools: &[],
+                max_output_tokens: 0,
+                reasoning_effort: "",
+                thinking: thinking_for(base_url, "deepseek-v4-pro"),
+            })
+        };
+
+        // DeepSeek: one assistant message per answer, with its reasoning,
+        // and an empty one where the answer did not think.
+        let replayed = body("https://api.deepseek.com");
+        let messages = replayed["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[1]["content"], "looking");
+        assert_eq!(messages[1]["reasoning_content"], "check Cargo.toml");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[3]["reasoning_content"], "now list");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(messages[5]["reasoning_content"], "");
+
+        // A DeepSeek model checks it on other hosts too.
+        let hosted = body("https://api.together.xyz/v1");
+        assert_eq!(hosted["messages"].as_array().unwrap().len(), 6);
+
+        // Other models leave the field out (strict servers reject it).
+        let plain = request_body(&ChatRequest {
+            model: "qwen3-coder",
+            system_prompt: "",
+            input: &input,
+            tools: &[],
+            max_output_tokens: 0,
+            reasoning_effort: "",
+            thinking: thinking_for("https://api.together.xyz/v1", "qwen3-coder"),
+        });
+        let messages = plain["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 7);
+        assert!(messages
+            .iter()
+            .all(|m| m.get("reasoning_content").is_none()));
     }
 
     #[test]
