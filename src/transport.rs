@@ -116,6 +116,11 @@ pub struct ClientConfig<'a> {
     /// Extra headers per model name, added to requests whose body `model`
     /// matches — e.g. a gateway's routing header for the chosen group.
     pub model_headers: HashMap<String, Vec<(String, String)>>,
+    /// Extra headers on every request of this client, whatever the model —
+    /// e.g. a gateway's device identification. Sent before `model_headers`;
+    /// give them names of their own (ureq sends every `X-` header it is
+    /// given, so one of the same name would go twice).
+    pub headers: Vec<(String, String)>,
 }
 
 /// Cloning shares the prompt-cache turn state, so a derived client (a subagent,
@@ -129,6 +134,7 @@ pub struct Client {
     retry_attempts: usize,
     cache_debug: bool,
     model_headers: Arc<HashMap<String, Vec<(String, String)>>>,
+    headers: Arc<Vec<(String, String)>>,
     turn_state: Arc<OnceLock<String>>,
     /// Set by the request's owner to stop it (see `set_interrupt`).
     interrupt: Option<Arc<AtomicBool>>,
@@ -144,6 +150,7 @@ impl Client {
             retry_attempts: config.retry_attempts,
             cache_debug: config.cache_debug,
             model_headers: Arc::new(config.model_headers),
+            headers: Arc::new(config.headers),
             turn_state: Arc::new(OnceLock::new()),
             interrupt: None,
         }
@@ -253,6 +260,9 @@ impl Client {
             if let Some(account_id) = responses::codex_account_id(&self.api_key) {
                 request = request.set("chatgpt-account-id", &account_id);
             }
+        }
+        for (name, value) in self.headers.iter() {
+            request = request.set(name, value);
         }
         let model = body.get("model").and_then(Value::as_str).unwrap_or("");
         for (name, value) in self.model_headers.get(model).into_iter().flatten() {
@@ -949,6 +959,7 @@ mod tests {
             retry_attempts: 1,
             cache_debug: false,
             model_headers: HashMap::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -1397,6 +1408,49 @@ mod tests {
         }
         assert!(rx.recv().expect("first").contains("x-jucode-group: g1"));
         assert!(!rx.recv().expect("second").contains("x-jucode-group"));
+    }
+
+    #[test]
+    fn client_headers_go_with_every_model_beside_the_model_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream).unwrap_or_default();
+                let _ = tx.send(String::from_utf8_lossy(&request).to_lowercase());
+                let _ = stream.write_all(sse_response("").as_bytes());
+            }
+        });
+        let client = Client::new(ClientConfig {
+            headers: vec![("X-Device".to_string(), "d1".to_string())],
+            model_headers: HashMap::from([(
+                "special".to_string(),
+                vec![("X-Route".to_string(), "r2".to_string())],
+            )]),
+            ..test_config()
+        });
+        for model in ["any", "special"] {
+            let _ = client.clone().send(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({ "model": model }),
+                Duration::from_secs(2),
+            );
+        }
+        let first = rx.recv().expect("first");
+        assert!(
+            first.contains("x-device: d1") && !first.contains("x-route"),
+            "{first}"
+        );
+        let second = rx.recv().expect("second");
+        assert!(
+            second.contains("x-device: d1") && second.contains("x-route: r2"),
+            "{second}"
+        );
     }
 
     #[test]
