@@ -295,7 +295,9 @@ pub fn protocol_for_api(api: &str) -> Option<Protocol> {
 }
 
 impl OmpCatalog {
-    fn parse(root: &Value) -> Self {
+    /// A catalog in the shape of the vendored artifact; [`catalog`] is the
+    /// vendored one. Missing or malformed parts are left out.
+    pub fn parse(root: &Value) -> Self {
         let providers = root
             .get("authProviders")
             .and_then(Value::as_array)
@@ -389,6 +391,54 @@ impl OmpCatalog {
             .map(|m| m.base_url.as_str())
             .filter(|url| !url.is_empty())
             .or_else(|| self.default_base_url(provider))
+    }
+
+    /// Base URL to send `model` to when the provider is configured with
+    /// `configured`. Some providers serve each wire dialect at a URL of its
+    /// own (zenmux: Chat Completions under /api/v1, Messages under
+    /// /api/anthropic), but a client is configured with one base URL. When
+    /// `configured` is one of the provider's catalog URLs, placeholders such
+    /// as Cloudflare's `<account>` filled in, the result is the URL of the
+    /// dialect `model` routes to, with the same placeholder values. It is in
+    /// the form this crate's endpoint builders take: a catalog Messages URL
+    /// is an SDK base URL (requests go to `{url}/v1/messages`), so one that
+    /// `anthropic::messages_url` would mount `/anthropic` on comes with
+    /// `/v1`. None: `configured` is none of the provider's URLs (an endpoint
+    /// of the user's own, which is used as it is), or the model's dialect is
+    /// one this crate does not speak.
+    pub fn route_base_url(&self, provider: &str, configured: &str, model: &str) -> Option<String> {
+        let (api, target) = self.route_url(provider, model)?;
+        let configured = configured.trim().trim_end_matches('/');
+        let mut others: Vec<&str> = self
+            .models(provider)
+            .iter()
+            .map(|m| m.base_url.as_str())
+            .filter(|url| !url.is_empty() && *url != target)
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        std::iter::once(target)
+            .chain(others)
+            .find_map(|url| template_values(url, configured))
+            .and_then(|values| fill_template(target, &values))
+            .map(|url| builder_base(api, url))
+    }
+
+    /// The dialect `model` routes to and its catalog URL: the model's own
+    /// entry's when the entry declares that dialect, else the one URL the
+    /// provider's models of that dialect share. Supported dialects only.
+    fn route_url(&self, provider: &str, model: &str) -> Option<(&str, &str)> {
+        let api = self.api_for(provider, model)?;
+        protocol_for_api(api)?;
+        let mut urls = self
+            .models(provider)
+            .iter()
+            .filter(|m| m.api == api && !m.base_url.is_empty());
+        if let Some(entry) = urls.clone().find(|m| m.id == model) {
+            return Some((api, &entry.base_url));
+        }
+        let first = urls.next()?.base_url.as_str();
+        urls.all(|m| m.base_url == first).then_some((api, first))
     }
 
     /// Wire dialect for (provider, model): api-routes rules win over the
@@ -495,6 +545,98 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         p += 1;
     }
     p == pat.len()
+}
+
+/// A catalog URL split at its placeholders (`<account>`, `{project}`).
+enum UrlPart<'a> {
+    Text(&'a str),
+    Placeholder(&'a str),
+}
+
+fn url_parts(template: &str) -> Vec<UrlPart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = template.trim_end_matches('/');
+    while let Some(start) = rest.find(['<', '{']) {
+        let close = if rest[start..].starts_with('<') {
+            '>'
+        } else {
+            '}'
+        };
+        let Some(length) = rest[start..].find(close) else {
+            break;
+        };
+        if start > 0 {
+            parts.push(UrlPart::Text(&rest[..start]));
+        }
+        parts.push(UrlPart::Placeholder(&rest[start..=start + length]));
+        rest = &rest[start + length + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(UrlPart::Text(rest));
+    }
+    parts
+}
+
+/// The placeholder values that make `template` read `url`, each one or more
+/// characters without a `/` (the same placeholder the same value
+/// throughout); None when no values do. Trailing slashes do not count.
+fn template_values<'a>(template: &'a str, url: &'a str) -> Option<Vec<(&'a str, &'a str)>> {
+    fn fits<'a>(parts: &[UrlPart<'a>], url: &'a str, values: &mut Vec<(&'a str, &'a str)>) -> bool {
+        let Some((part, rest)) = parts.split_first() else {
+            return url.is_empty();
+        };
+        let name = match part {
+            UrlPart::Text(text) => {
+                return url
+                    .strip_prefix(text)
+                    .is_some_and(|tail| fits(rest, tail, values))
+            }
+            UrlPart::Placeholder(name) => *name,
+        };
+        if let Some(&(_, known)) = values.iter().find(|(n, _)| *n == name) {
+            return url
+                .strip_prefix(known)
+                .is_some_and(|tail| fits(rest, tail, values));
+        }
+        let segment = url.find('/').unwrap_or(url.len());
+        for end in (1..=segment).filter(|end| url.is_char_boundary(*end)) {
+            values.push((name, &url[..end]));
+            if fits(rest, &url[end..], values) {
+                return true;
+            }
+            values.pop();
+        }
+        false
+    }
+    let mut values = Vec::new();
+    fits(&url_parts(template), url.trim_end_matches('/'), &mut values).then_some(values)
+}
+
+/// `url`, a catalog URL of dialect `api`, in the form the endpoint builders
+/// take. The catalog's Messages URLs are SDK base URLs, sent to
+/// `{url}/v1/messages`; `anthropic::messages_url` mounts `/anthropic` on a
+/// URL that ends in neither `/v1` nor `/anthropic`, so such a URL gets its
+/// `/v1` here.
+fn builder_base(api: &str, url: String) -> String {
+    if api == "anthropic-messages"
+        && crate::anthropic::messages_url(&url) != format!("{url}/v1/messages")
+    {
+        format!("{url}/v1")
+    } else {
+        url
+    }
+}
+
+/// `template` with its placeholders replaced by `values`; None when one has
+/// no value.
+fn fill_template(template: &str, values: &[(&str, &str)]) -> Option<String> {
+    url_parts(template)
+        .into_iter()
+        .map(|part| match part {
+            UrlPart::Text(text) => Some(text),
+            UrlPart::Placeholder(name) => values.iter().find(|(n, _)| *n == name).map(|(_, v)| *v),
+        })
+        .collect()
 }
 
 // ---- parsing helpers ------------------------------------------------------
@@ -857,6 +999,241 @@ mod tests {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("a*c", "abc"));
         assert!(!glob_match("a*c", "abd"));
+    }
+
+    /// A provider with one URL per dialect, one whose URLs carry
+    /// placeholders, and one model on a dialect this crate does not speak.
+    fn split_catalog() -> OmpCatalog {
+        let model = |id: &str, api: &str, base_url: &str| {
+            (
+                id.to_string(),
+                serde_json::json!({ "id": id, "api": api, "baseUrl": base_url }),
+            )
+        };
+        let table = |models: Vec<(String, Value)>| Value::Object(models.into_iter().collect());
+        OmpCatalog::parse(&serde_json::json!({
+            "apiRoutes": [{
+                "provider": "split",
+                "routes": [
+                    { "api": "anthropic-messages", "match": { "prefix": ["anthropic/"] } },
+                    { "api": "openai-responses", "match": { "exact": ["openai/coder"] } }
+                ],
+                "default": "openai-completions"
+            }],
+            "models": {
+                "split": table(vec![
+                    model("anthropic/claude", "anthropic-messages", "https://split.test/api/anthropic/"),
+                    model("openai/chat", "openai-completions", "https://split.test/api/v1"),
+                    // Declared on Messages, routed to Chat Completions.
+                    model("openai/mislabeled", "anthropic-messages", "https://split.test/api/anthropic/"),
+                    model("openai/coder", "openai-responses", "https://split.test/api/openai/v1"),
+                ]),
+                // Messages at the bare base (opencode, Command Code).
+                "bare": table(vec![
+                    model("claude", "anthropic-messages", "https://bare.test/zen"),
+                    model("chat", "openai-completions", "https://bare.test/zen/v1"),
+                ]),
+                "gateway": table(vec![
+                    model("anthropic/claude", "anthropic-messages", "https://gw.test/v1/<account>/<gateway>/anthropic"),
+                    model("workers/llama", "openai-completions", "https://gw.test/v1/<account>/<gateway>/compat"),
+                    model("google/gemini", "google-generative-ai", "https://gw.test/v1/<account>/<gateway>/google"),
+                ]),
+            }
+        }))
+    }
+
+    #[test]
+    fn a_model_is_sent_to_its_dialects_url_from_any_of_the_providers_urls() {
+        let catalog = split_catalog();
+        let route =
+            |configured: &str, model: &str| catalog.route_base_url("split", configured, model);
+        let chat = "https://split.test/api/v1";
+        let messages = "https://split.test/api/anthropic";
+        assert_eq!(route(chat, "anthropic/claude").as_deref(), Some(messages));
+        // A model the catalog does not list goes where its route's models are.
+        assert_eq!(
+            route(chat, "anthropic/claude-next").as_deref(),
+            Some(messages)
+        );
+        assert_eq!(
+            route(chat, "openai/coder").as_deref(),
+            Some("https://split.test/api/openai/v1")
+        );
+        assert_eq!(route(messages, "openai/chat").as_deref(), Some(chat));
+        assert_eq!(
+            route(&format!("{messages}/"), "some/model").as_deref(),
+            Some(chat)
+        );
+        // The route wins over a declared dialect, and its URL with it.
+        assert_eq!(route(messages, "openai/mislabeled").as_deref(), Some(chat));
+        // Already there.
+        assert_eq!(route(chat, "openai/chat").as_deref(), Some(chat));
+        assert_eq!(
+            route(&format!("{messages}/"), "anthropic/claude").as_deref(),
+            Some(messages)
+        );
+        // An endpoint of the user's own is used as it is.
+        assert_eq!(
+            route("https://proxy.example/split/v1", "anthropic/claude"),
+            None
+        );
+        assert_eq!(
+            route("https://split.test/api/v1/extra", "anthropic/claude"),
+            None
+        );
+        // Not a provider with routes of its own.
+        assert_eq!(catalog.route_base_url("lynshen", chat, "claude-x"), None);
+    }
+
+    #[test]
+    fn a_messages_url_without_its_own_mount_comes_with_v1() {
+        let catalog = split_catalog();
+        let route =
+            |configured: &str, model: &str| catalog.route_base_url("bare", configured, model);
+        // Sent to https://bare.test/zen/v1/messages, as the catalog means it.
+        for configured in ["https://bare.test/zen", "https://bare.test/zen/v1"] {
+            let expected = Some("https://bare.test/zen/v1");
+            assert_eq!(route(configured, "claude").as_deref(), expected);
+            assert_eq!(route(configured, "chat").as_deref(), expected);
+        }
+        assert_eq!(
+            crate::anthropic::messages_url("https://bare.test/zen/v1"),
+            "https://bare.test/zen/v1/messages"
+        );
+    }
+
+    #[test]
+    fn placeholders_filled_in_the_configured_url_carry_over() {
+        let catalog = split_catalog();
+        let route =
+            |configured: &str, model: &str| catalog.route_base_url("gateway", configured, model);
+        let compat = "https://gw.test/v1/acct-1/main/compat";
+        assert_eq!(
+            route(compat, "anthropic/claude").as_deref(),
+            Some("https://gw.test/v1/acct-1/main/anthropic")
+        );
+        assert_eq!(
+            route("https://gw.test/v1/acct-1/main/anthropic", "workers/llama").as_deref(),
+            Some(compat)
+        );
+        // A placeholder stands for one path segment.
+        assert_eq!(
+            route("https://gw.test/v1/a/b/c/compat", "anthropic/claude"),
+            None
+        );
+        // No dialect this crate speaks: nothing to move to.
+        assert_eq!(route(compat, "google/gemini"), None);
+    }
+
+    #[test]
+    fn template_values_name_each_placeholder_once() {
+        let template = "https://{location}-ai.test/v1/{project}/locations/{location}/x";
+        assert_eq!(
+            template_values(template, "https://us-ai.test/v1/p1/locations/us/x"),
+            Some(vec![("{location}", "us"), ("{project}", "p1")])
+        );
+        assert_eq!(
+            template_values(template, "https://us-ai.test/v1/p1/locations/eu/x"),
+            None
+        );
+        assert_eq!(
+            fill_template(
+                "https://{location}-ai.test/{project}",
+                &[("{location}", "us")]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn vendored_providers_with_a_url_per_dialect_route_each_model() {
+        let catalog = catalog();
+        // (provider, configured base_url, model, where the model goes)
+        let cases = [
+            (
+                "zenmux",
+                "https://zenmux.ai/api/v1",
+                "anthropic/claude-sonnet-4.5",
+                "https://zenmux.ai/api/anthropic",
+            ),
+            (
+                "zenmux",
+                "https://zenmux.ai/api/anthropic",
+                "openai/gpt-5",
+                "https://zenmux.ai/api/v1",
+            ),
+            (
+                "zai",
+                "https://api.z.ai/api/anthropic",
+                "glm-5.3-flash",
+                "https://api.z.ai/api/coding/paas/v4",
+            ),
+            (
+                "gitlab-duo",
+                "https://cloud.gitlab.com/ai/v1/proxy/openai/v1",
+                "claude-sonnet-4-5-20250929",
+                "https://cloud.gitlab.com/ai/v1/proxy/anthropic",
+            ),
+            (
+                "opencode-zen",
+                "https://opencode.ai/zen/v1",
+                "claude-3-5-haiku",
+                "https://opencode.ai/zen/v1",
+            ),
+            (
+                "opencode-go",
+                "https://opencode.ai/zen/go",
+                "minimax-m2.5",
+                "https://opencode.ai/zen/go/v1",
+            ),
+            (
+                "commandcode",
+                "https://api.commandcode.ai/provider/v1",
+                "claude-sonnet-5",
+                "https://api.commandcode.ai/provider/v1",
+            ),
+            (
+                "commandcode",
+                "https://api.commandcode.ai/provider",
+                "deepseek/deepseek-v4-flash",
+                "https://api.commandcode.ai/provider/v1",
+            ),
+            (
+                "cloudflare-ai-gateway",
+                "https://gateway.ai.cloudflare.com/v1/acc/gw/compat",
+                "anthropic/claude-sonnet-4-5",
+                "https://gateway.ai.cloudflare.com/v1/acc/gw/anthropic",
+            ),
+            // One URL for every model.
+            (
+                "vercel-ai-gateway",
+                "https://ai-gateway.vercel.sh",
+                "anthropic/claude-sonnet-4.5",
+                "https://ai-gateway.vercel.sh/v1",
+            ),
+            (
+                "openai",
+                "https://api.openai.com/v1",
+                "gpt-5.5",
+                "https://api.openai.com/v1",
+            ),
+            (
+                "anthropic",
+                "https://api.anthropic.com",
+                "claude-sonnet-4-5",
+                "https://api.anthropic.com",
+            ),
+        ];
+        for (provider, configured, model, expected) in cases {
+            let routed = catalog.route_base_url(provider, configured, model);
+            assert_eq!(routed.as_deref(), Some(expected), "{provider} {model}");
+        }
+        // An endpoint of the user's own.
+        let relay = "https://relay.example/zenmux/v1";
+        assert_eq!(
+            catalog.route_base_url("zenmux", relay, "openai/gpt-5"),
+            None
+        );
     }
 
     #[test]
