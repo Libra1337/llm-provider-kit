@@ -2,7 +2,7 @@
 //! sanitizing. Output items are already in the canonical Responses format, so
 //! no conversion happens on the way out.
 
-use crate::{normalized_arguments, read_sse_data, Usage, WireEvent};
+use crate::{has_answer, normalized_arguments, read_sse_data, NoAnswer, Usage, WireEvent};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -223,8 +223,10 @@ fn handle_sse_data(
         // `response.incomplete` is a normal terminal event (e.g. max_output_tokens
         // reached): accept the parsed output instead of failing the stream.
         "response.completed" | "response.incomplete" => {
+            let mut output_tokens = None;
             if let Some(response) = event.get("response") {
                 if let Some(usage) = extract_usage(response) {
+                    output_tokens = Some(usage.output_tokens);
                     emit(WireEvent::Usage(usage))?;
                 }
             }
@@ -243,6 +245,13 @@ fn handle_sse_data(
                     }
                 }
             }
+            let reason = event
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(error) = no_answer_error(reason, output_items, output_tokens) {
+                return Err(error);
+            }
             return Ok(true);
         }
         "response.failed" | "error" => {
@@ -251,6 +260,22 @@ fn handle_sse_data(
         _ => {}
     }
     Ok(false)
+}
+
+/// The [`NoAnswer`] error for an incomplete reply without an answer
+/// (`incomplete_details.reason` `max_output_tokens` or `content_filter`);
+/// None otherwise.
+pub fn no_answer_error(
+    incomplete_reason: &str,
+    items: &[Value],
+    output_tokens: Option<u64>,
+) -> Option<String> {
+    let kind = match incomplete_reason {
+        "max_output_tokens" => NoAnswer::OutputLimit,
+        "content_filter" => NoAnswer::Refusal,
+        _ => return None,
+    };
+    (!has_answer(items)).then(|| kind.error(incomplete_reason, output_tokens))
 }
 
 /// Fields of a tool call accumulated across Responses streaming events, keyed
@@ -508,6 +533,29 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "message");
         assert!(usage_seen);
+    }
+
+    #[test]
+    fn incomplete_reasoning_without_an_answer_is_an_error() {
+        for (reason, kind) in [
+            ("max_output_tokens", NoAnswer::OutputLimit),
+            ("content_filter", NoAnswer::Refusal),
+        ] {
+            let sse = format!(
+                concat!(
+                    "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"reasoning\",\"summary\":[]}}}}\n\n",
+                    "data: {{\"type\":\"response.incomplete\",\"response\":{{\"incomplete_details\":{{\"reason\":\"{}\"}},\"usage\":{{\"input_tokens\":3,\"output_tokens\":8192}}}}}}\n\n",
+                ),
+                reason
+            );
+            let error = read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err(reason);
+            let expected = format!("(stop reason {reason}, 8192 output tokens)");
+            assert_eq!(
+                NoAnswer::from_error(&error),
+                Some((kind, expected.as_str())),
+                "{error}"
+            );
+        }
     }
 
     #[test]

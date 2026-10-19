@@ -439,6 +439,12 @@ impl Client {
                 let value =
                     serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
                 let (output_items, usage) = json_items(protocol, &value);
+                if let Some(error) = json_no_answer(protocol, &value, &output_items, usage) {
+                    if let Some(usage) = usage {
+                        emit(StreamEvent::Wire(WireEvent::Usage(usage)))?;
+                    }
+                    return Err(error);
+                }
                 for item in &output_items {
                     let text = item_text(item);
                     if !text.is_empty() {
@@ -473,7 +479,17 @@ impl Client {
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
                     self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A reply without an answer still spent its tokens.
+                    if crate::NoAnswer::from_error(&error).is_some() {
+                        for event in buffered {
+                            if let WireEvent::Usage(usage) = event {
+                                emit(StreamEvent::Wire(WireEvent::Usage(usage)))?;
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
         unreachable!("streaming retry loop always returns")
@@ -661,6 +677,36 @@ fn json_items(protocol: Protocol, value: &Value) -> (Vec<Value>, Option<Usage>) 
             anthropic::message_usage(value),
         ),
         Protocol::OpenAiChatCompletions => chat::completion_to_items(value),
+    }
+}
+
+/// The [`crate::NoAnswer`] error for a non-streaming reply without an answer
+/// that stopped on the output limit or a refusal.
+fn json_no_answer(
+    protocol: Protocol,
+    value: &Value,
+    items: &[Value],
+    usage: Option<Usage>,
+) -> Option<String> {
+    let text = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let output_tokens = usage.map(|usage| usage.output_tokens);
+    match protocol {
+        Protocol::OpenAiResponses
+        | Protocol::OpenAiCodexResponses
+        | Protocol::AzureOpenAiResponses => {
+            responses::no_answer_error(text("/incomplete_details/reason"), items, output_tokens)
+        }
+        Protocol::AnthropicMessages => {
+            anthropic::no_answer_error(text("/stop_reason"), items, output_tokens)
+        }
+        Protocol::OpenAiChatCompletions => {
+            chat::no_answer_error(text("/choices/0/finish_reason"), items, output_tokens)
+        }
     }
 }
 
@@ -1101,6 +1147,40 @@ mod tests {
         assert_eq!(connected, 1);
         assert_eq!(deltas, vec!["hi".to_string()]);
         assert_eq!(items.len(), 1);
+    }
+
+    /// Thinking that used up the output limit: one request (not retried),
+    /// the NoAnswer error, and the usage still reported.
+    #[test]
+    fn a_reply_without_an_answer_is_not_retried_and_keeps_its_usage() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":8192}}}\n\n",
+        );
+        let ok = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let base = serve(vec![sse_response(body), sse_response(ok)]);
+        let (mut connected, mut output_tokens) = (0, 0);
+        let error = test_client()
+            .stream(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(2),
+                &mut |event| {
+                    match event {
+                        StreamEvent::Connected => connected += 1,
+                        StreamEvent::Wire(WireEvent::Usage(usage)) => {
+                            output_tokens += usage.output_tokens
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("no answer");
+        assert!(crate::NoAnswer::from_error(&error).is_some(), "{error}");
+        assert_eq!(connected, 1);
+        assert_eq!(output_tokens, 8192);
     }
 
     #[test]
@@ -1702,6 +1782,69 @@ mod tests {
         let error = anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(()))
             .expect_err("truncated tool_use should fail");
         assert!(!is_retryable_stream_error(&error));
+
+        // Thinking with no answer on the output limit or a refusal: the same
+        // request would spend the same thinking for the same outcome.
+        for stop_reason in ["max_tokens", "refusal"] {
+            let sse = format!(
+                concat!(
+                    "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\"}}}}\n\n",
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}}}\n\n",
+                    "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                    "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{}\"}},\"usage\":{{\"output_tokens\":9}}}}\n\n",
+                    "data: {{\"type\":\"message_stop\"}}\n\n",
+                ),
+                stop_reason
+            );
+            let error =
+                anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err(stop_reason);
+            assert!(crate::NoAnswer::from_error(&error).is_some(), "{error}");
+            assert!(!is_retryable_stream_error(&error), "{error}");
+        }
+        for (finish, sse) in [
+            ("length", "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hmm\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"),
+            ("max_output_tokens", "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"),
+        ] {
+            let error = if finish == "length" {
+                chat::read_sse_stream(sse.as_bytes(), |_| Ok(()))
+            } else {
+                responses::read_sse_stream(sse.as_bytes(), |_| Ok(()))
+            }
+            .expect_err(finish);
+            assert!(crate::NoAnswer::from_error(&error).is_some(), "{error}");
+            assert!(!is_retryable_stream_error(&error), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_replies_without_an_answer_are_errors() {
+        let cases = [
+            (
+                Protocol::AnthropicMessages,
+                serde_json::json!({ "content": [{ "type": "thinking", "thinking": "hmm" }],
+                        "stop_reason": "max_tokens", "usage": { "input_tokens": 1, "output_tokens": 9 } }),
+            ),
+            (
+                Protocol::OpenAiChatCompletions,
+                serde_json::json!({ "choices": [{ "message": { "content": "" }, "finish_reason": "content_filter" }] }),
+            ),
+            (
+                Protocol::OpenAiResponses,
+                serde_json::json!({ "output": [], "incomplete_details": { "reason": "max_output_tokens" } }),
+            ),
+        ];
+        for (protocol, value) in cases {
+            let (items, usage) = json_items(protocol, &value);
+            let error = json_no_answer(protocol, &value, &items, usage).expect("no answer");
+            assert!(crate::NoAnswer::from_error(&error).is_some(), "{error}");
+        }
+        // An empty end_turn passes: the caller decides.
+        let value = serde_json::json!({ "content": [], "stop_reason": "end_turn" });
+        let (items, usage) = json_items(Protocol::AnthropicMessages, &value);
+        assert_eq!(
+            json_no_answer(Protocol::AnthropicMessages, &value, &items, usage),
+            None
+        );
     }
 
     #[test]
