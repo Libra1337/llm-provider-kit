@@ -440,6 +440,9 @@ impl Client {
                     serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
                 let (output_items, usage) = json_items(protocol, &value);
                 if let Some(error) = json_no_answer(protocol, &value, &output_items, usage) {
+                    if let Some(usage) = usage {
+                        emit(StreamEvent::Wire(WireEvent::Usage(usage)))?;
+                    }
                     return Err(error);
                 }
                 for item in &output_items {
@@ -476,7 +479,17 @@ impl Client {
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
                     self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A reply without an answer still spent its tokens.
+                    if crate::NoAnswer::from_error(&error).is_some() {
+                        for event in buffered {
+                            if let WireEvent::Usage(usage) = event {
+                                emit(StreamEvent::Wire(WireEvent::Usage(usage)))?;
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
         unreachable!("streaming retry loop always returns")
@@ -1134,6 +1147,40 @@ mod tests {
         assert_eq!(connected, 1);
         assert_eq!(deltas, vec!["hi".to_string()]);
         assert_eq!(items.len(), 1);
+    }
+
+    /// Thinking that used up the output limit: one request (not retried),
+    /// the NoAnswer error, and the usage still reported.
+    #[test]
+    fn a_reply_without_an_answer_is_not_retried_and_keeps_its_usage() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":8192}}}\n\n",
+        );
+        let ok = "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        let base = serve(vec![sse_response(body), sse_response(ok)]);
+        let (mut connected, mut output_tokens) = (0, 0);
+        let error = test_client()
+            .stream(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(2),
+                &mut |event| {
+                    match event {
+                        StreamEvent::Connected => connected += 1,
+                        StreamEvent::Wire(WireEvent::Usage(usage)) => {
+                            output_tokens += usage.output_tokens
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("no answer");
+        assert!(crate::NoAnswer::from_error(&error).is_some(), "{error}");
+        assert_eq!(connected, 1);
+        assert_eq!(output_tokens, 8192);
     }
 
     #[test]
