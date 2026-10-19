@@ -7,7 +7,10 @@
 //! (richer reasoning support), so this path deliberately uses the widely
 //! compatible `max_tokens` field rather than `max_completion_tokens`.
 
-use crate::{normalized_arguments, read_sse_data, response_content_text, Usage, WireEvent};
+use crate::{
+    has_answer, normalized_arguments, read_sse_data, response_content_text, NoAnswer, Usage,
+    WireEvent,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -641,8 +644,28 @@ pub fn read_sse_stream(
     let held = state.think.finish();
     emit_content_parts(held, &mut state.text, &mut state.reasoning, &mut emit)?;
 
+    let finish_reason = state.finish_reason.clone();
+    let output_tokens = state.usage.map(|usage| usage.output_tokens);
     let items = state_to_items(state, &mut emit)?;
+    if let Some(error) = no_answer_error(&finish_reason, &items, output_tokens) {
+        return Err(error);
+    }
     Ok(items)
+}
+
+/// The [`NoAnswer`] error for a reply without an answer that stopped on the
+/// output limit (`length`) or a content filter; None otherwise.
+pub fn no_answer_error(
+    finish_reason: &str,
+    items: &[Value],
+    output_tokens: Option<u64>,
+) -> Option<String> {
+    let kind = match finish_reason {
+        "length" => NoAnswer::OutputLimit,
+        "content_filter" => NoAnswer::Refusal,
+        _ => return None,
+    };
+    (!has_answer(items)).then(|| kind.error(finish_reason, output_tokens))
 }
 
 fn handle_sse_data(
@@ -1098,6 +1121,39 @@ mod tests {
         let sse = "data: {\"error\":{\"message\":\"model not found\",\"code\":404}}\n\n";
         let error = read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err("error payload");
         assert!(error.contains("model not found"));
+    }
+
+    #[test]
+    fn reasoning_without_an_answer_on_length_or_content_filter_is_an_error() {
+        for (finish, kind) in [
+            ("length", NoAnswer::OutputLimit),
+            ("content_filter", NoAnswer::Refusal),
+        ] {
+            let sse = format!(
+                concat!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"thinking\"}},\"finish_reason\":null}}]}}\n\n",
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{}\"}}]}}\n\n",
+                    "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":5,\"completion_tokens\":8192}}}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+                finish
+            );
+            let error = read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err(finish);
+            let expected = format!("(stop reason {finish}, 8192 output tokens)");
+            assert_eq!(
+                NoAnswer::from_error(&error),
+                Some((kind, expected.as_str())),
+                "{error}"
+            );
+        }
+        // An answer cut by the limit is kept.
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let items = read_sse_stream(sse.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(items[0]["content"][0]["text"], "half");
     }
 
     #[test]

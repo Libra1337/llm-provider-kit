@@ -2,7 +2,7 @@
 //! Responses-style input items, SSE stream parsing, and usage normalization
 //! back to OpenAI subset semantics.
 
-use crate::{read_sse_data, response_content_text, Usage, WireEvent};
+use crate::{has_answer, read_sse_data, response_content_text, NoAnswer, Usage, WireEvent};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 
@@ -585,12 +585,36 @@ fn handle_sse_data(
                 output_tokens: state.output_tokens,
                 reasoning_tokens: 0,
             }))?;
+            if let Some(error) = no_answer_error(
+                &state.stop_reason,
+                &state.output_items,
+                Some(state.output_tokens),
+            ) {
+                return Err(error);
+            }
             return Ok(true);
         }
         "error" => return Err(event.to_string()),
         _ => {}
     }
     Ok(false)
+}
+
+/// The [`NoAnswer`] error for a reply without an answer that stopped on the
+/// output limit, the context window or a refusal; None otherwise (an empty
+/// `end_turn` is the caller's to handle).
+pub fn no_answer_error(
+    stop_reason: &str,
+    items: &[Value],
+    output_tokens: Option<u64>,
+) -> Option<String> {
+    let kind = match stop_reason {
+        "max_tokens" => NoAnswer::OutputLimit,
+        "model_context_window_exceeded" => NoAnswer::ContextWindow,
+        "refusal" => NoAnswer::Refusal,
+        _ => return None,
+    };
+    (!has_answer(items)).then(|| kind.error(stop_reason, output_tokens))
 }
 
 /// Normalizes Anthropic usage to OpenAI semantics: OpenAI's `cached_tokens` is
@@ -826,6 +850,68 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "thinking");
         assert_eq!(items[0]["signature"], "sig-xyz");
+    }
+
+    /// Claude Opus 5.5 at the default `display: "omitted"`: a signed thinking
+    /// block with no text. Stopped on the output limit or a refusal before
+    /// any answer, the reply is an error, not an empty success.
+    fn thinking_only(stop_reason: &str) -> String {
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":9,\"output_tokens\":1}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"signature_delta\",\"signature\":\"sig\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{}\"}},\"usage\":{{\"output_tokens\":8192}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            stop_reason
+        )
+    }
+
+    #[test]
+    fn thinking_without_an_answer_on_the_output_limit_or_a_refusal_is_an_error() {
+        for (stop_reason, kind) in [
+            ("max_tokens", NoAnswer::OutputLimit),
+            ("refusal", NoAnswer::Refusal),
+            ("model_context_window_exceeded", NoAnswer::ContextWindow),
+        ] {
+            let mut usage = None;
+            let error = read_sse_stream(thinking_only(stop_reason).as_bytes(), |event| {
+                if let WireEvent::Usage(seen) = event {
+                    usage = Some(seen);
+                }
+                Ok(())
+            })
+            .expect_err(stop_reason);
+            assert_eq!(
+                NoAnswer::from_error(&error),
+                Some((
+                    kind,
+                    format!("(stop reason {stop_reason}, 8192 output tokens)").as_str()
+                )),
+                "{error}"
+            );
+            // The usage still reaches the caller: the tokens were spent.
+            assert_eq!(usage.unwrap().output_tokens, 8192);
+        }
+        // An empty end_turn is not one of these: the caller decides.
+        let items = read_sse_stream(thinking_only("end_turn").as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "thinking");
+    }
+
+    #[test]
+    fn an_answer_cut_by_the_output_limit_is_kept() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"half an answer\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let items = read_sse_stream(sse.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(items[0]["content"][0]["text"], "half an answer");
     }
 
     #[test]

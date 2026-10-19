@@ -125,6 +125,69 @@ pub enum WireEvent {
     Usage(Usage),
 }
 
+/// Why a reply that ended normally carries no answer: no text and no tool
+/// call, only thinking. The parsers turn such a reply into an error (see
+/// [`NoAnswer::error`]) instead of an empty success, so a caller does not
+/// mistake it for "nothing more to say" and quietly end the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// The output limit was reached before any answer: thinking used it up.
+    OutputLimit,
+    /// The context window filled up before any answer.
+    ContextWindow,
+    /// The model (or a safety filter) declined to answer.
+    Refusal,
+}
+
+const NO_ANSWER_PREFIX: &str = "no answer: ";
+
+impl NoAnswer {
+    fn code(self) -> &'static str {
+        match self {
+            Self::OutputLimit => "output_limit",
+            Self::ContextWindow => "context_window",
+            Self::Refusal => "refusal",
+        }
+    }
+
+    /// The parser error for this reply: `stop_reason` as the provider sent
+    /// it, and the output tokens when known. Not a retryable transport error:
+    /// the same request would spend the same thinking for the same outcome.
+    pub fn error(self, stop_reason: &str, output_tokens: Option<u64>) -> String {
+        let tokens = output_tokens
+            .filter(|tokens| *tokens > 0)
+            .map(|tokens| format!(", {tokens} output tokens"))
+            .unwrap_or_default();
+        format!(
+            "{NO_ANSWER_PREFIX}{} (stop reason {stop_reason}{tokens})",
+            self.code()
+        )
+    }
+
+    /// The kind of a [`NoAnswer::error`] message, and its details in
+    /// parentheses.
+    pub fn from_error(error: &str) -> Option<(Self, &str)> {
+        let rest = error.strip_prefix(NO_ANSWER_PREFIX)?;
+        let (code, details) = rest.split_once(' ').unwrap_or((rest, ""));
+        let kind = [Self::OutputLimit, Self::ContextWindow, Self::Refusal]
+            .into_iter()
+            .find(|kind| kind.code() == code)?;
+        Some((kind, details.trim()))
+    }
+}
+
+/// True when the output items hold an answer: a tool call, or assistant text
+/// that is not only whitespace. Thinking alone is not one.
+pub fn has_answer(items: &[Value]) -> bool {
+    items.iter().any(
+        |item| match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "function_call" | "custom_tool_call" => true,
+            "message" => !response_content_text(item, "output_text").trim().is_empty(),
+            _ => false,
+        },
+    )
+}
+
 /// Text of a response item's content parts, taking `preferred_type` and plain
 /// "text" parts. Works on both input (`input_text`) and output (`output_text`)
 /// items.
@@ -226,5 +289,45 @@ mod tests {
         ] {
             assert_eq!(Protocol::resolve(protocol.as_str(), "any-model"), protocol);
         }
+    }
+
+    #[test]
+    fn no_answer_errors_round_trip() {
+        for kind in [
+            NoAnswer::OutputLimit,
+            NoAnswer::ContextWindow,
+            NoAnswer::Refusal,
+        ] {
+            let error = kind.error("max_tokens", Some(8192));
+            assert_eq!(
+                NoAnswer::from_error(&error),
+                Some((kind, "(stop reason max_tokens, 8192 output tokens)"))
+            );
+            // Unknown or zero token counts are left out.
+            let error = kind.error("refusal", Some(0));
+            assert_eq!(
+                NoAnswer::from_error(&error),
+                Some((kind, "(stop reason refusal)"))
+            );
+        }
+        assert_eq!(NoAnswer::from_error("no answer: bogus (x)"), None);
+        assert_eq!(NoAnswer::from_error("stream closed"), None);
+    }
+
+    #[test]
+    fn thinking_alone_is_not_an_answer() {
+        let thinking = serde_json::json!({ "type": "reasoning", "summary": [] });
+        let blank = serde_json::json!({
+            "type": "message",
+            "content": [{ "type": "output_text", "text": " \n" }]
+        });
+        let text = serde_json::json!({
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "hi" }]
+        });
+        let call = serde_json::json!({ "type": "function_call", "name": "read" });
+        assert!(!has_answer(&[thinking.clone(), blank]));
+        assert!(has_answer(&[thinking.clone(), text]));
+        assert!(has_answer(&[thinking, call]));
     }
 }
