@@ -1474,7 +1474,7 @@ mod tests {
         let client = Client::new(ClientConfig {
             model_headers: HashMap::from([(
                 "grouped".to_string(),
-                vec![("X-JuCode-Group".to_string(), "g1".to_string())],
+                vec![("X-LynShen-Group".to_string(), "g1".to_string())],
             )]),
             ..test_config()
         });
@@ -1486,8 +1486,8 @@ mod tests {
                 Duration::from_secs(2),
             );
         }
-        assert!(rx.recv().expect("first").contains("x-jucode-group: g1"));
-        assert!(!rx.recv().expect("second").contains("x-jucode-group"));
+        assert!(rx.recv().expect("first").contains("x-lynshen-group: g1"));
+        assert!(!rx.recv().expect("second").contains("x-lynshen-group"));
     }
 
     #[test]

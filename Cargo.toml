@@ -2,7 +2,7 @@
 name = "llm-provider-kit"
 version = "0.1.0"
 license = "Apache-2.0"
-authors = ["Jucode Innovations INC."]
+authors = ["LynShen Innovations INC."]
 edition = "2021"
 description = "Multi-provider LLM wire protocols, provider catalog, provider templates, and provider logins"
 
