@@ -81,7 +81,7 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
         thinking_budget.is_some()
     };
     let mut messages = input_to_messages(request.input, thinks);
-    mark_cache_breakpoint(&mut messages);
+    mark_cache_breakpoints(&mut messages);
     // An empty text block is rejected, so only a non-empty system prompt
     // carries a breakpoint, and an empty part is left out.
     let prompt = request.system_prompt;
@@ -124,14 +124,35 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     body
 }
 
-/// Prompt-cache breakpoint on the last block of the conversation, so each
-/// request writes the cache the next one reads (the system prompt carries the
-/// other breakpoint). Some gateways cache only marked prompts. Thinking blocks
-/// cannot carry one.
-fn mark_cache_breakpoint(messages: &mut [Value]) {
-    let block = messages
-        .last_mut()
-        .and_then(|message| message.get_mut("content"))
+/// Most `cache_control` breakpoints one Messages request may carry.
+pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Prompt-cache breakpoints in the conversation; the system prompt's stable
+/// part carries one more (see [`request_body`]). One goes on the first user
+/// message, whose prefix stays the same while the conversation grows, and
+/// one on the last block, so each request writes the cache the next one
+/// reads. Some gateways cache only marked prompts, and some relays choose
+/// the upstream account by the first marked message: with only the newest
+/// message marked, each request goes to another account and a cold cache.
+/// That is three breakpoints at most (two when the first user message is
+/// also the last), one below [`MAX_CACHE_BREAKPOINTS`], so a relay can still
+/// add its own. The tools carry none. Thinking blocks cannot carry one.
+fn mark_cache_breakpoints(messages: &mut [Value]) {
+    if let Some(first) = messages
+        .iter_mut()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        mark_last_block(first);
+    }
+    if let Some(last) = messages.last_mut() {
+        mark_last_block(last);
+    }
+}
+
+/// A breakpoint on the message's last block that can carry one.
+fn mark_last_block(message: &mut Value) {
+    let block = message
+        .get_mut("content")
         .and_then(Value::as_array_mut)
         .and_then(|blocks| {
             blocks.iter_mut().rev().find(|block| {
@@ -150,8 +171,9 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
 pub const ADAPTIVE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// True for Claude models that take adaptive thinking instead of a thinking
-/// budget: Fable and Mythos, and Opus/Sonnet from 4.6 on. Haiku and older
-/// Opus/Sonnet keep `budget_tokens`.
+/// budget: Fable and Mythos, and Opus/Sonnet/Haiku from 4.6 on (Haiku 5.5
+/// refuses `budget_tokens` with a 400). Haiku 4.5 and older Opus/Sonnet keep
+/// `budget_tokens`.
 pub fn uses_adaptive_thinking(model: &str) -> bool {
     let name = model.rsplit('/').next().unwrap_or(model);
     let Some(rest) = name.strip_prefix("claude-") else {
@@ -161,7 +183,7 @@ pub fn uses_adaptive_thinking(model: &str) -> bool {
         return true;
     }
     let version = match rest.split_once('-') {
-        Some(("opus" | "sonnet", version)) => version,
+        Some(("opus" | "sonnet" | "haiku", version)) => version,
         _ => return false,
     };
     // "4-8", "5-5", "5", "4-5-20251101": major, then a minor unless the next
@@ -1070,6 +1092,181 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
     }
 
+    /// Where a body carries `cache_control`: "tools[i]", "system[i]" and
+    /// "messages[i][j]", in body order.
+    fn breakpoints(body: &Value) -> Vec<String> {
+        let marked = |block: &Value| block.get("cache_control").is_some();
+        let mut found = Vec::new();
+        for (i, tool) in body["tools"].as_array().into_iter().flatten().enumerate() {
+            if marked(tool) {
+                found.push(format!("tools[{i}]"));
+            }
+        }
+        for (i, block) in body["system"].as_array().into_iter().flatten().enumerate() {
+            if marked(block) {
+                found.push(format!("system[{i}]"));
+            }
+        }
+        for (i, message) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (j, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if marked(block) {
+                    found.push(format!("messages[{i}][{j}]"));
+                }
+            }
+        }
+        found
+    }
+
+    fn user(text: &str) -> Value {
+        json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] })
+    }
+
+    fn agent_body(input: &[Value], effort: &str) -> Value {
+        let tools = tool_definitions(&[
+            json!({ "name": "read", "description": "read a file", "parameters": { "type": "object" } }),
+            json!({ "name": "write", "description": "write a file", "parameters": { "type": "object" } }),
+        ]);
+        let prompt = "base and tools\n\n<env>\nDate: 2026-11-04\n</env>";
+        request_body(&AnthropicRequest {
+            model: "claude-opus-5-5",
+            system_prompt: prompt,
+            stable_system_len: prompt.find("\n\n<env>"),
+            input,
+            tools: &tools,
+            max_output_tokens: 32_000,
+            reasoning_effort: effort,
+        })
+    }
+
+    #[test]
+    fn breakpoints_go_on_the_stable_system_part_the_first_user_message_and_the_last_block() {
+        // An agent turn: the user's request, a tool round, the tool's result.
+        let input = vec![
+            user("fix the bug"),
+            json!({ "type": "thinking", "thinking": "look first", "signature": "sig-1" }),
+            json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Reading." }] }),
+            json!({ "type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "c1", "output": "file text" }),
+        ];
+        let body = agent_body(&input, "high");
+        assert_eq!(
+            breakpoints(&body),
+            ["system[0]", "messages[0][0]", "messages[2][0]"]
+        );
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        // The system prompt's dated part and the tools stay unmarked.
+        assert!(body["system"][1].get("cache_control").is_none());
+
+        // The next request: the first user message keeps its breakpoint at
+        // the same place, so the request starts as the last one did.
+        let mut longer = input.clone();
+        longer.push(json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Fixed." }] }));
+        longer.push(user("now run the tests"));
+        let next = agent_body(&longer, "high");
+        assert_eq!(
+            breakpoints(&next),
+            ["system[0]", "messages[0][0]", "messages[4][0]"]
+        );
+        assert_eq!(next["messages"][0], body["messages"][0]);
+    }
+
+    #[test]
+    fn no_request_carries_more_than_four_breakpoints() {
+        let call = |id: &str| json!({ "type": "function_call", "call_id": id, "name": "read", "arguments": "{}" });
+        let output =
+            |id: &str| json!({ "type": "function_call_output", "call_id": id, "output": "x" });
+        let image = json!({ "role": "user", "content": [
+            { "type": "input_text", "text": "look" },
+            { "type": "input_image", "image_url": "data:image/png;base64,AAAA" }
+        ] });
+        let shapes: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![user("one message")],
+            vec![image.clone()],
+            vec![
+                user("a"),
+                call("c1"),
+                output("c1"),
+                call("c2"),
+                call("c3"),
+                output("c2"),
+                output("c3"),
+            ],
+            vec![
+                image,
+                call("c1"),
+                output("c1"),
+                user("b"),
+                call("c2"),
+                output("c2"),
+                user("c"),
+            ],
+            // A conversation that ends on the assistant (a compaction
+            // request is sent after one).
+            vec![
+                user("a"),
+                json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "done" }] }),
+            ],
+        ];
+        for input in &shapes {
+            for effort in ["", "none", "high"] {
+                let body = agent_body(input, effort);
+                let found = breakpoints(&body);
+                assert!(
+                    found.len() < MAX_CACHE_BREAKPOINTS,
+                    "{} breakpoints: {found:?}",
+                    found.len()
+                );
+                assert!(found.iter().all(|at| !at.starts_with("tools")), "{found:?}");
+            }
+        }
+        // One user message is both the first and the last: one breakpoint.
+        assert_eq!(
+            breakpoints(&agent_body(&[user("one message")], "high")),
+            ["system[0]", "messages[0][0]"]
+        );
+        // Images: the last block of the first message carries it.
+        let body = agent_body(&shapes[2], "high");
+        assert_eq!(breakpoints(&body), ["system[0]", "messages[0][1]"]);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+    }
+
+    #[test]
+    fn a_thinking_block_never_carries_a_breakpoint() {
+        // The assistant's reply ends the conversation with thinking after
+        // its text (a summary request after a turn).
+        let input = vec![
+            user("a"),
+            json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "done" }] }),
+            json!({ "type": "thinking", "thinking": "t", "signature": "sig" }),
+        ];
+        let body = agent_body(&input, "high");
+        assert_eq!(body["messages"][1]["content"][1]["type"], "thinking");
+        assert_eq!(
+            breakpoints(&body),
+            ["system[0]", "messages[0][0]", "messages[1][0]"]
+        );
+        // Only thinking in the last message: it goes without one.
+        let only = vec![
+            user("a"),
+            json!({ "type": "thinking", "thinking": "t", "signature": "sig" }),
+        ];
+        assert_eq!(
+            breakpoints(&agent_body(&only, "high")),
+            ["system[0]", "messages[0][0]"]
+        );
+    }
+
     #[test]
     fn the_breakpoint_marks_only_the_stable_start_of_the_system_prompt() {
         let prompt = "base and tools\n\n<env>\nDate: 2026-10-09\n</env>";
@@ -1173,14 +1370,29 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_thinking_starts_at_opus_and_sonnet_4_6() {
+    fn adaptive_thinking_starts_at_opus_sonnet_and_haiku_4_6() {
         assert!(uses_adaptive_thinking("claude-opus-4-6"));
         assert!(uses_adaptive_thinking("claude-sonnet-5"));
         assert!(uses_adaptive_thinking("anthropic/claude-mythos-5-1"));
         assert!(!uses_adaptive_thinking("claude-opus-4-5-20251101"));
         assert!(!uses_adaptive_thinking("claude-sonnet-4-5"));
         assert!(!uses_adaptive_thinking("claude-haiku-4-5"));
+        assert!(!uses_adaptive_thinking("claude-haiku-4-5-20251001"));
         assert!(!uses_adaptive_thinking("gpt-5.5"));
+        // Haiku 5.5 thinks adaptively and refuses a budget.
+        assert!(uses_adaptive_thinking("claude-haiku-5-5"));
+        let body = request_body(&AnthropicRequest {
+            model: "claude-haiku-5-5",
+            system_prompt: "system",
+            stable_system_len: None,
+            input: &[],
+            tools: &[],
+            max_output_tokens: 32_000,
+            reasoning_effort: "high",
+        });
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(body["thinking"].get("budget_tokens").is_none());
     }
 
     #[test]
