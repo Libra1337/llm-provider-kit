@@ -191,6 +191,13 @@ pub(crate) fn remember_fallback(url: &str, reason: &str) {
     );
 }
 
+/// Whether a failed upgrade says anything about the endpoint's WebSocket
+/// mode: a rejected key (401) or a rate limit (429) is the account's, and
+/// HTTPS gets the same answer.
+pub(crate) fn says_no_websocket(status: Option<u16>) -> bool {
+    !matches!(status, Some(401 | 429))
+}
+
 /// Why `url` is on HTTPS now, while that lasts.
 pub(crate) fn fallback_reason(url: &str) -> Option<String> {
     let mut fallbacks = fallbacks().lock().unwrap_or_else(|p| p.into_inner());
@@ -221,6 +228,25 @@ pub fn websocket_url(url: &str) -> String {
 struct Continuation {
     response_id: String,
     history: Vec<Value>,
+    /// The request's fields: the server keeps the last request's and lays
+    /// the next one's over them, so a field the next one leaves out would
+    /// stay. A request with other fields goes whole.
+    fields: Vec<String>,
+}
+
+fn fields_of(body: &Value) -> Vec<String> {
+    let mut fields: Vec<String> = body
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| !matches!(key.as_str(), "input" | "stream" | "background"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    fields.sort();
+    fields
 }
 
 /// The message for `body`: `response.create` with the transport-only fields
@@ -238,7 +264,11 @@ fn create_message(body: &Value, continuation: Option<&Continuation>) -> (Value, 
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    match continuation.and_then(|state| tail_after(input, state)) {
+    let continues = |state: &&Continuation| state.fields == fields_of(body);
+    match continuation
+        .filter(continues)
+        .and_then(|state| tail_after(input, state))
+    {
         Some((id, tail)) => {
             message["previous_response_id"] = json!(id);
             message["input"] = Value::Array(tail);
@@ -260,7 +290,7 @@ fn tail_after(input: &[Value], state: &Continuation) -> Option<(String, Vec<Valu
 /// keeps, item for item as they go back in the next request, so that a
 /// continued request means exactly what the whole one would.
 fn continuation_after(
-    sent_input: &[Value],
+    body: &Value,
     response_id: Option<&str>,
     server_output: Option<&[Value]>,
     output_items: &[Value],
@@ -271,11 +301,16 @@ fn continuation_after(
     if kept != held {
         return None;
     }
-    let mut history = sent_input.to_vec();
+    let mut history = body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     history.extend(kept);
     Some(Continuation {
         response_id: response_id.to_string(),
         history,
+        fields: fields_of(body),
     })
 }
 
@@ -431,6 +466,8 @@ pub(crate) struct Target<'a> {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub interrupt: Option<&'a Arc<AtomicBool>>,
+    /// Where an upgrade's `x-codex-turn-state` goes, as an HTTPS answer's.
+    pub turn_state: Option<&'a OnceLock<String>>,
 }
 
 /// How a WebSocket request ended.
@@ -646,9 +683,8 @@ fn request(
             .feed(&event.to_string(), &mut *on_event)
             .map_err(Failure::Stream)?;
         if done {
-            let sent_input = message_input(body);
             connection.continuation = continuation_after(
-                &sent_input,
+                body,
                 decoder.response_id(),
                 decoder.terminal_output(),
                 decoder.output_items(),
@@ -657,15 +693,6 @@ fn request(
             return Ok(Sent { items, info });
         }
     }
-}
-
-/// The input the server holds for `body` once it completed: all of it (a
-/// continued request's server joins what it held and the new items).
-fn message_input(body: &Value) -> Vec<Value> {
-    body.get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// An `error` event: the server's answer to the request.
@@ -736,24 +763,25 @@ fn open(
     lane: &str,
     fingerprint: u64,
 ) -> Result<Connection, Failure> {
-    let (url, headers, proxy, timeout) = (
+    let (url, headers, proxy, timeout, turn_state) = (
         ws_url.to_string(),
         target.headers.clone(),
         target.proxy.map(str::to_string),
         target.connect_timeout,
+        target.turn_state.is_some(),
     );
     let (sender, result) = mpsc::channel();
     let spawned = thread::Builder::new()
         .name("llm-websocket".to_string())
         .spawn(move || {
-            let _ = sender.send(dial(&url, &headers, proxy.as_deref(), timeout));
+            let _ = sender.send(dial(&url, &headers, proxy.as_deref(), timeout, turn_state));
         });
     if spawned.is_err() {
         return Err(before_first("could not start the WebSocket connection"));
     }
-    let socket = loop {
+    let (socket, state) = loop {
         match result.recv_timeout(POLL) {
-            Ok(socket) => break socket?,
+            Ok(dialed) => break dialed?,
             Err(RecvTimeoutError::Timeout) => {
                 if target
                     .interrupt
@@ -767,6 +795,9 @@ fn open(
             }
         }
     };
+    if let (Some(cell), Some(state)) = (target.turn_state, state) {
+        let _ = cell.set(state);
+    }
     let now = Instant::now();
     Ok(Connection {
         socket,
@@ -787,7 +818,8 @@ fn dial(
     headers: &[(String, String)],
     proxy: Option<&str>,
     timeout: Duration,
-) -> Result<Socket, Failure> {
+    want_turn_state: bool,
+) -> Result<(Socket, Option<String>), Failure> {
     let mut request = url
         .into_client_request()
         .map_err(|error| before_first(format!("WebSocket URL {url}: {error}")))?;
@@ -821,7 +853,16 @@ fn dial(
         .max_message_size(Some(RECEIVE_MAX))
         .max_frame_size(Some(RECEIVE_MAX));
     match tungstenite::client_tls_with_config(request, tcp, Some(config), None) {
-        Ok((socket, _)) => Ok(socket),
+        Ok((socket, response)) => {
+            let turn_state = response
+                .headers()
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| want_turn_state && !value.is_empty())
+                .map(str::to_string);
+            Ok((socket, turn_state))
+        }
         Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
             let status = response.status().as_u16();
             let retry_after = response
@@ -1057,15 +1098,16 @@ mod tests {
 
     #[test]
     fn a_request_that_continues_the_held_state_sends_only_its_new_items() {
-        let state = Continuation {
-            response_id: "resp_1".to_string(),
-            history: vec![item("a"), json!({ "type": "function_call", "call_id": "c1" })],
-        };
         let body = json!({
             "model": "m",
             "stream": true,
             "input": [item("a"), { "type": "function_call", "call_id": "c1" }, { "type": "function_call_output", "call_id": "c1", "output": "ok" }]
         });
+        let state = Continuation {
+            response_id: "resp_1".to_string(),
+            history: vec![item("a"), json!({ "type": "function_call", "call_id": "c1" })],
+            fields: fields_of(&body),
+        };
         let (message, incremental) = create_message(&body, Some(&state));
         assert!(incremental);
         assert_eq!(message["type"], "response.create");
@@ -1074,18 +1116,27 @@ mod tests {
         assert!(message.get("stream").is_none());
 
         // An input that does not start with the held state goes whole.
-        let other = json!({ "input": [item("b")] });
+        let other = json!({ "model": "m", "input": [item("b")] });
         let (message, incremental) = create_message(&other, Some(&state));
         assert!(!incremental);
         assert!(message.get("previous_response_id").is_none());
         assert_eq!(message["input"].as_array().unwrap().len(), 1);
+
+        // So does one with other fields: the server would keep the last
+        // request's `tool_choice`.
+        let mut more = body.clone();
+        more["tool_choice"] = json!("none");
+        let (message, incremental) = create_message(&more, Some(&state));
+        assert!(!incremental);
+        assert_eq!(message["input"].as_array().unwrap().len(), 3);
     }
 
     #[test]
     fn the_state_continues_only_when_the_server_kept_the_same_output() {
-        let input = vec![item("a")];
+        let input = json!({ "model": "m", "input": [item("a")] });
         let ours = vec![json!({ "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "ls", "arguments": "{}" })];
         let state = continuation_after(&input, Some("resp_1"), Some(&ours), &ours).unwrap();
+        assert_eq!(state.fields, ["model"]);
         // The next request's input carries the output without its ids.
         assert_eq!(state.history.len(), 2);
         assert!(state.history[1].get("id").is_none());

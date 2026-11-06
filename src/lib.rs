@@ -36,6 +36,8 @@ pub mod providers;
 pub mod responses;
 pub mod transport;
 pub mod websocket;
+#[cfg(test)]
+mod websocket_tests;
 
 pub use providers::{templates, ModelTemplate, ProviderTemplate};
 

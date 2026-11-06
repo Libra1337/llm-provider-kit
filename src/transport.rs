@@ -609,6 +609,7 @@ impl Client {
             connect_timeout: self.connect_timeout,
             read_timeout,
             interrupt: self.interrupt.as_ref(),
+            turn_state: (protocol == Protocol::OpenAiCodexResponses).then_some(&*self.turn_state),
         };
         for attempt in 1..=max_attempts {
             if self.interrupted() {
@@ -654,10 +655,21 @@ impl Client {
                 return Err(error);
             }
             match failure {
-                Failure::BeforeFirstEvent { message, .. } | Failure::Unsupported(message)
-                    if auto =>
-                {
-                    crate::websocket::remember_fallback(url, &message);
+                // Nothing of the response came: HTTPS carries this request,
+                // and the next ones for a while when the failure says the
+                // endpoint has no WebSocket mode.
+                Failure::BeforeFirstEvent {
+                    message, status, ..
+                } if auto => {
+                    if crate::websocket::says_no_websocket(status) {
+                        crate::websocket::remember_fallback(url, &message);
+                    }
+                    let info = crate::websocket::TransportInfo::https(Some(message));
+                    return self.stream_http(protocol, url, body, read_timeout, Some(info), emit);
+                }
+                // Too large for this server's WebSocket mode: this request
+                // only.
+                Failure::Unsupported(message) if auto => {
                     let info = crate::websocket::TransportInfo::https(Some(message));
                     return self.stream_http(protocol, url, body, read_timeout, Some(info), emit);
                 }
@@ -1236,7 +1248,7 @@ mod tests {
             cache_debug: false,
             model_headers: HashMap::new(),
             headers: Vec::new(),
-            // The HTTPS tests: the WebSocket ones are in tests/websocket.rs.
+            // The HTTPS tests; the WebSocket ones are in websocket_tests.rs.
             transport: crate::websocket::TransportMode::Http,
             proxy: None,
             lane: String::new(),
