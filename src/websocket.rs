@@ -52,14 +52,20 @@ const AGE_MAX: Duration = Duration::from_secs(55 * 60);
 /// (`websocket_connection_limit_reached`); a connection is retired first.
 const TURNS_MAX: usize = 120;
 const BYTES_MAX: usize = 90 * 1024 * 1024;
-/// The gateway's message limit is 50 MiB; a larger request goes over HTTPS
-/// in `auto` mode.
-const MESSAGE_MAX: usize = 48 * 1024 * 1024;
+/// The gateway keeps at most 4096 items and 32 MiB of a conversation on a
+/// connection (and takes messages up to 50 MiB); `auto` sends a larger
+/// request over HTTPS rather than have it refused.
+const MESSAGE_MAX: usize = 30 * 1024 * 1024;
+const ITEMS_MAX: usize = 4000;
 /// Events can be large (a terminal event repeats the whole output).
 const RECEIVE_MAX: usize = 64 * 1024 * 1024;
 /// Idle connections kept per conversation, and in all.
 const IDLE_PER_LANE: usize = 2;
 const IDLE_TOTAL: usize = 16;
+/// `auto` gives up on a connection that is not up after this long (the
+/// request then goes over HTTPS): a network that holds the upgrade must not
+/// cost the user a whole connect timeout.
+pub(crate) const AUTO_CONNECT_MAX: Duration = Duration::from_secs(10);
 /// How often a read looks at the interrupt flag.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -170,8 +176,14 @@ pub(crate) fn choose(mode: TransportMode, protocol: Protocol, url: &str, body: &
     if let Some(reason) = fallback_reason(url) {
         return Choice::Http(Some(reason));
     }
-    if serde_json::to_vec(body).map_or(0, |bytes| bytes.len()) > MESSAGE_MAX {
-        return Choice::Http(Some("the request is larger than a WebSocket message".to_string()));
+    let items = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if items > ITEMS_MAX || serde_json::to_vec(body).map_or(0, |bytes| bytes.len()) > MESSAGE_MAX {
+        return Choice::Http(Some(
+            "the conversation is larger than the WebSocket mode keeps".to_string(),
+        ));
     }
     Choice::WebSocket
 }
@@ -196,6 +208,20 @@ pub(crate) fn remember_fallback(url: &str, reason: &str) {
 /// HTTPS gets the same answer.
 pub(crate) fn says_no_websocket(status: Option<u16>) -> bool {
     !matches!(status, Some(401 | 429))
+}
+
+/// The endpoints `auto` keeps on HTTPS now: URL, why, and for how long
+/// more.
+pub fn fallbacks_now() -> Vec<(String, String, Duration)> {
+    let fallbacks = fallbacks().lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    let mut list: Vec<_> = fallbacks
+        .iter()
+        .filter(|(_, (until, _))| *until > now)
+        .map(|(url, (until, reason))| (url.clone(), reason.clone(), *until - now))
+        .collect();
+    list.sort();
+    list
 }
 
 /// Why `url` is on HTTPS now, while that lasts.
@@ -368,8 +394,8 @@ fn pool() -> &'static Mutex<Vec<Connection>> {
 }
 
 /// An idle connection for `lane` with `fingerprint`, the one whose server
-/// state `input` continues first. Connections of the lane with other
-/// headers (an earlier turn's) are closed: their server state is no use.
+/// state `input` continues first. Connections past their age, idle time or
+/// request count are closed on the way.
 fn checkout(lane: &str, fingerprint: u64, input: &[Value]) -> Option<Connection> {
     let mut retired = Vec::new();
     let taken = {
@@ -377,18 +403,16 @@ fn checkout(lane: &str, fingerprint: u64, input: &[Value]) -> Option<Connection>
         let mut index = 0;
         while index < pool.len() {
             let connection = &pool[index];
-            let stale = connection.idle_since.elapsed() > IDLE_MAX || connection.worn();
-            if stale || (connection.lane == lane && connection.fingerprint != fingerprint) {
+            if connection.idle_since.elapsed() > IDLE_MAX || connection.worn() {
                 retired.push(pool.remove(index));
             } else {
                 index += 1;
             }
         }
-        let candidates = pool
+        let best = pool
             .iter()
             .enumerate()
-            .filter(|(_, connection)| connection.fingerprint == fingerprint && connection.lane == lane);
-        let best = candidates
+            .filter(|(_, connection)| connection.fingerprint == fingerprint && connection.lane == lane)
             .max_by_key(|(_, connection)| {
                 let continues = connection
                     .continuation

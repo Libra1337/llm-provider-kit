@@ -606,7 +606,11 @@ impl Client {
             headers,
             lane_key: &lane_key,
             proxy: self.proxy.as_deref(),
-            connect_timeout: self.connect_timeout,
+            connect_timeout: if auto {
+                self.connect_timeout.min(crate::websocket::AUTO_CONNECT_MAX)
+            } else {
+                self.connect_timeout
+            },
             read_timeout,
             interrupt: self.interrupt.as_ref(),
             turn_state: (protocol == Protocol::OpenAiCodexResponses).then_some(&*self.turn_state),

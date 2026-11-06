@@ -267,6 +267,10 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
 }
 
 fn client(mode: TransportMode, key: &str) -> Client {
+    client_through(mode, key, None)
+}
+
+fn client_through(mode: TransportMode, key: &str, proxy: Option<String>) -> Client {
     Client::new(ClientConfig {
         api_key: "test-key",
         prompt_cache_key: key,
@@ -277,9 +281,43 @@ fn client(mode: TransportMode, key: &str) -> Client {
         model_headers: HashMap::new(),
         headers: vec![("X-Device".to_string(), "d1".to_string())],
         transport: mode,
-        proxy: None,
+        proxy,
         lane: String::new(),
     })
+}
+
+/// An HTTP proxy that tunnels CONNECT requests; counts the tunnels.
+fn connect_proxy() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("addr");
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&targets);
+    thread::spawn(move || {
+        while let Ok((mut client, _)) = listener.accept() {
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                let Ok(head) = read_head(&mut client) else { return };
+                let Some(target) = head
+                    .strip_prefix("CONNECT ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .map(str::to_string)
+                else {
+                    let _ = client.write_all(b"HTTP/1.1 405 Not Allowed\r\n\r\n");
+                    return;
+                };
+                seen.lock().unwrap().push(target.clone());
+                let Ok(upstream) = TcpStream::connect(&target) else { return };
+                let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let (mut a, mut b) = (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut a, &mut b);
+                });
+                let (mut c, mut d) = (upstream, client);
+                let _ = std::io::copy(&mut c, &mut d);
+            });
+        }
+    });
+    (format!("http://{address}"), targets)
 }
 
 fn user(text: &str) -> Value {
@@ -513,6 +551,17 @@ fn a_cut_stream_never_hands_on_its_tool_call_twice() {
         )
         .unwrap();
     assert_eq!(items, 1);
+}
+
+#[test]
+fn a_configured_proxy_carries_the_websocket_through_a_connect_tunnel() {
+    let mock = serve(Behavior::default());
+    let (proxy, tunnels) = connect_proxy();
+    let client = client_through(TransportMode::WebSocket, "ws-proxy", Some(proxy));
+    let outcomes = converse(&client, &mock.base, 2);
+    assert_eq!(outcomes[1].deltas, "seen 3 items");
+    let host = mock.base.trim_start_matches("http://").trim_end_matches("/v1").to_string();
+    assert_eq!(*tunnels.lock().unwrap(), [host], "one tunnel, kept for both requests");
 }
 
 #[test]
