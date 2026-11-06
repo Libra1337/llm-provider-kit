@@ -121,39 +121,97 @@ pub fn read_sse_stream(
     reader: impl std::io::Read,
     mut emit: impl FnMut(WireEvent) -> Result<(), String>,
 ) -> Result<Vec<Value>, String> {
-    let mut output_items = Vec::new();
-    let mut completed = false;
+    let mut decoder = StreamDecoder::default();
+    read_sse_data(reader, |data| {
+        if data == "[DONE]" {
+            return Ok(true);
+        }
+        decoder.feed(data, &mut emit)
+    })?;
+    decoder.finish()
+}
+
+/// The Responses event stream, one JSON event at a time, whatever carries
+/// it: SSE `data:` payloads or WebSocket text messages.
+#[derive(Default)]
+pub struct StreamDecoder {
+    output_items: Vec<Value>,
+    completed: bool,
+    /// The terminal event's `response.output`, as the server keeps it.
+    terminal_output: Option<Vec<Value>>,
+    /// The terminal event's `response.id`.
+    response_id: Option<String>,
     // Accumulates streamed function-call fields keyed by the stable item id.
     // The Responses API streams a tool call's name/call_id in
     // `response.output_item.added` and its arguments via
     // `response.function_call_arguments.delta`, then may deliver the final
     // `response.output_item.done` item with those fields blanked out —
     // expecting the consumer to have stitched the pieces together.
-    let mut streamed_calls: BTreeMap<String, StreamedFunctionCall> = BTreeMap::new();
+    streamed_calls: BTreeMap<String, StreamedFunctionCall>,
+}
 
-    read_sse_data(reader, |data| {
-        if data == "[DONE]" {
-            return Ok(true);
+impl StreamDecoder {
+    /// Decodes one event; Ok(true) once it was the terminal one.
+    pub fn feed(
+        &mut self,
+        data: &str,
+        emit: &mut impl FnMut(WireEvent) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let event = serde_json::from_str::<Value>(data).map_err(|error| error.to_string())?;
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            let response = event.get("response");
+            self.response_id = response
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            self.terminal_output = response
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+                .cloned();
         }
-        let done = handle_sse_data(data, &mut emit, &mut output_items, &mut streamed_calls)?;
-        completed = completed || done;
+        let done = handle_sse_data(
+            event,
+            emit,
+            &mut self.output_items,
+            &mut self.streamed_calls,
+        )?;
+        self.completed = self.completed || done;
         Ok(done)
-    })?;
-
-    if !completed {
-        return Err("stream closed before response.completed".to_string());
     }
 
-    Ok(output_items)
+    /// The completed output items; an error when no terminal event came.
+    pub fn finish(self) -> Result<Vec<Value>, String> {
+        if !self.completed {
+            return Err("stream closed before response.completed".to_string());
+        }
+        Ok(self.output_items)
+    }
+
+    /// The id of the response the terminal event closed.
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
+
+    /// The terminal event's own `response.output`, when it carried one.
+    pub fn terminal_output(&self) -> Option<&[Value]> {
+        self.terminal_output.as_deref()
+    }
+
+    /// The output items decoded so far.
+    pub fn output_items(&self) -> &[Value] {
+        &self.output_items
+    }
 }
 
 fn handle_sse_data(
-    data: &str,
+    event: Value,
     emit: &mut impl FnMut(WireEvent) -> Result<(), String>,
     output_items: &mut Vec<Value>,
     streamed_calls: &mut BTreeMap<String, StreamedFunctionCall>,
 ) -> Result<bool, String> {
-    let event = serde_json::from_str::<Value>(data).map_err(|error| error.to_string())?;
     match event
         .get("type")
         .and_then(Value::as_str)

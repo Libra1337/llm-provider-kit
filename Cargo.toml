@@ -11,4 +11,7 @@ base64 = "0.22"
 getrandom = "0.2"
 serde_json = "1"
 sha2 = "0.10"
+# The Responses WebSocket mode (`websocket`). Already in the LynShen CLI's
+# build through its daemon, with the same TLS (rustls, ring, webpki roots).
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "2", features = ["json"] }
