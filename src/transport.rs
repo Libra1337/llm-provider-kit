@@ -50,6 +50,9 @@ const AZURE_DEFAULT_API_VERSION: &str = "v1";
 pub enum StreamEvent {
     /// The request was accepted (after any retries).
     Connected,
+    /// How the request travels, sent right after `Connected`: WebSocket or
+    /// HTTPS, and why HTTPS when `auto` would have used WebSocket.
+    Transport(crate::websocket::TransportInfo),
     /// The request failed with `reason` and is re-sent after `delay_ms`;
     /// `attempt` is the next attempt number, of `max_attempts`.
     Retrying {
@@ -121,6 +124,13 @@ pub struct ClientConfig<'a> {
     /// give them names of their own (ureq sends every `X-` header it is
     /// given, so one of the same name would go twice).
     pub headers: Vec<(String, String)>,
+    /// How Responses requests travel (`transport` in config.json).
+    pub transport: crate::websocket::TransportMode,
+    /// An `http://` proxy for model requests; None: direct.
+    pub proxy: Option<String>,
+    /// What keeps one conversation's requests on one WebSocket connection
+    /// (with `prompt_cache_key`): the agent's path, say.
+    pub lane: String,
 }
 
 /// Cloning shares the prompt-cache turn state, so a derived client (a subagent,
@@ -138,6 +148,9 @@ pub struct Client {
     turn_state: Arc<OnceLock<String>>,
     /// Set by the request's owner to stop it (see `set_interrupt`).
     interrupt: Option<Arc<AtomicBool>>,
+    transport: crate::websocket::TransportMode,
+    proxy: Option<String>,
+    lane: String,
 }
 
 impl Client {
@@ -153,7 +166,24 @@ impl Client {
             headers: Arc::new(config.headers),
             turn_state: Arc::new(OnceLock::new()),
             interrupt: None,
+            transport: config.transport,
+            proxy: config.proxy,
+            lane: config.lane,
         }
+    }
+
+    /// A clone whose streams keep to a WebSocket connection of their own
+    /// (a subagent's conversation is not its parent's).
+    pub fn with_lane(&self, lane: &str) -> Self {
+        Self {
+            lane: lane.to_string(),
+            ..self.clone()
+        }
+    }
+
+    /// How Responses requests of this client travel.
+    pub fn transport_mode(&self) -> crate::websocket::TransportMode {
+        self.transport
     }
 
     /// The flag that stops this client's requests: once it is set, `stream`,
@@ -232,44 +262,12 @@ impl Client {
         body: Value,
         read_timeout: Duration,
     ) -> Result<ureq::Response, RequestError> {
-        let mut request = shared_agent(self.connect_timeout, read_timeout)
+        let mut request = shared_agent(self.connect_timeout, read_timeout, self.proxy.as_deref())
             .post(url)
             .set("Accept", "text/event-stream")
-            .set("Content-Type", "application/json")
-            .set("session-id", &self.prompt_cache_key)
-            .set("thread-id", &self.prompt_cache_key)
-            .set("x-client-request-id", &self.prompt_cache_key);
-        // Azure authenticates with an `api-key` header, the official Anthropic
-        // API with x-api-key; everything else, the Codex backend included,
-        // takes the Bearer scheme.
-        if protocol == Protocol::AzureOpenAiResponses {
-            request = request.set("api-key", &self.api_key);
-        } else if anthropic::is_official_url(url) {
-            request = request.set("x-api-key", &self.api_key);
-        } else {
-            request = request.set("Authorization", &format!("Bearer {}", self.api_key));
-        }
-        if protocol == Protocol::AnthropicMessages {
-            request = request.set("anthropic-version", anthropic::ANTHROPIC_VERSION);
-        }
-        if protocol == Protocol::OpenAiCodexResponses {
-            request = request
-                .set("OpenAI-Beta", CODEX_BETA_RESPONSES)
-                .set("originator", &self.client_name)
-                .set("version", CODEX_CLIENT_VERSION);
-            if let Some(account_id) = responses::codex_account_id(&self.api_key) {
-                request = request.set("chatgpt-account-id", &account_id);
-            }
-        }
-        for (name, value) in self.headers.iter() {
-            request = request.set(name, value);
-        }
-        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-        for (name, value) in self.model_headers.get(model).into_iter().flatten() {
-            request = request.set(name, value);
-        }
-        if let Some(turn_state) = self.turn_state.get() {
-            request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
+            .set("Content-Type", "application/json");
+        for (name, value) in self.request_headers(protocol, url, &body) {
+            request = request.set(&name, &value);
         }
         if self.cache_debug {
             eprintln!(
@@ -287,6 +285,51 @@ impl Client {
             );
         }
         Ok(response)
+    }
+
+    /// The headers a request to `url` carries besides its content type:
+    /// the session, the credentials, the dialect's own and the configured
+    /// ones. A WebSocket upgrade carries the same.
+    fn request_headers(&self, protocol: Protocol, url: &str, body: &Value) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        let mut set = |name: &str, value: &str| headers.push((name.to_string(), value.to_string()));
+        set("session-id", &self.prompt_cache_key);
+        set("thread-id", &self.prompt_cache_key);
+        set("x-client-request-id", &self.prompt_cache_key);
+        // Azure authenticates with an `api-key` header, the official Anthropic
+        // API with x-api-key; everything else, the Codex backend included,
+        // takes the Bearer scheme.
+        if protocol == Protocol::AzureOpenAiResponses {
+            set("api-key", &self.api_key);
+        } else if anthropic::is_official_url(url) {
+            set("x-api-key", &self.api_key);
+        } else {
+            set("Authorization", &format!("Bearer {}", self.api_key));
+        }
+        if protocol == Protocol::AnthropicMessages {
+            set("anthropic-version", anthropic::ANTHROPIC_VERSION);
+        }
+        if protocol == Protocol::OpenAiCodexResponses {
+            set("originator", &self.client_name);
+            set("version", CODEX_CLIENT_VERSION);
+            if let Some(account_id) = responses::codex_account_id(&self.api_key) {
+                set("chatgpt-account-id", &account_id);
+            }
+        }
+        for (name, value) in self.headers.iter() {
+            set(name, value);
+        }
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        for (name, value) in self.model_headers.get(model).into_iter().flatten() {
+            set(name, value);
+        }
+        if let Some(turn_state) = self.turn_state.get() {
+            set(X_CODEX_TURN_STATE_HEADER, turn_state);
+        }
+        if protocol == Protocol::OpenAiCodexResponses {
+            headers.push(("OpenAI-Beta".to_string(), CODEX_BETA_RESPONSES.to_string()));
+        }
+        headers
     }
 
     /// `send` with the configured retry policy.
@@ -367,6 +410,9 @@ impl Client {
     /// Sends one streaming request and returns its completed output items.
     /// Text deltas stream live; items and usage are buffered until the stream
     /// completes, so a retry cannot duplicate session state.
+    ///
+    /// A Responses request goes over WebSocket where the client's
+    /// [`crate::websocket::TransportMode`] says so (see `stream_websocket`).
     pub fn stream(
         &self,
         protocol: Protocol,
@@ -375,6 +421,36 @@ impl Client {
         read_timeout: Duration,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
+        match crate::websocket::choose(self.transport, protocol, url, body) {
+            crate::websocket::Choice::WebSocket => {
+                self.stream_websocket(protocol, url, body, read_timeout, emit)
+            }
+            crate::websocket::Choice::Http(fallback) => {
+                let info = crate::websocket::TransportInfo::https(fallback);
+                self.stream_http(protocol, url, body, read_timeout, Some(info), emit)
+            }
+        }
+    }
+
+    /// `stream` over HTTPS (POST + SSE). `info`: announced after
+    /// `Connected` for a Responses request (None: not announced).
+    fn stream_http(
+        &self,
+        protocol: Protocol,
+        url: &str,
+        body: &Value,
+        read_timeout: Duration,
+        info: Option<crate::websocket::TransportInfo>,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<Vec<Value>, String> {
+        let info = info.filter(|_| {
+            matches!(
+                protocol,
+                Protocol::OpenAiResponses
+                    | Protocol::OpenAiCodexResponses
+                    | Protocol::AzureOpenAiResponses
+            )
+        });
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
             // Single send per attempt: this loop owns all retries, so send and
@@ -395,6 +471,9 @@ impl Client {
                 Err(error) => return Err(error.message),
             };
             emit(StreamEvent::Connected)?;
+            if let Some(info) = &info {
+                emit(StreamEvent::Transport(info.clone()))?;
+            }
             let content_type = response
                 .header("content-type")
                 .unwrap_or_default()
@@ -495,6 +574,149 @@ impl Client {
         unreachable!("streaming retry loop always returns")
     }
 
+    /// `stream` over the Responses WebSocket mode, with the same retry
+    /// rules as HTTPS once the request reached the server. Before any event
+    /// came (the connection could not be opened, the upgrade was refused,
+    /// the connection closed at once), `auto` mode sends the request over
+    /// HTTPS instead and keeps the endpoint on HTTPS for a while; `websocket`
+    /// mode reports the failure as any request failure is (retried when it
+    /// is transient). After the first event a failure is a dropped stream:
+    /// nothing of the response was kept (items are passed on only once it
+    /// completed), and the request is sent again whole, as over HTTPS.
+    fn stream_websocket(
+        &self,
+        protocol: Protocol,
+        url: &str,
+        body: &Value,
+        read_timeout: Duration,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<Vec<Value>, String> {
+        use crate::websocket::{Failure, Target, TransportMode};
+        let auto = self.transport == TransportMode::Auto;
+        let max_attempts = self.max_attempts();
+        let mut headers = self.request_headers(protocol, url, body);
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("OpenAI-Beta"));
+        headers.push((
+            "OpenAI-Beta".to_string(),
+            crate::websocket::BETA_HEADER.to_string(),
+        ));
+        let lane_key = format!("{} {}", self.prompt_cache_key, self.lane);
+        let target = Target {
+            url,
+            headers,
+            lane_key: &lane_key,
+            proxy: self.proxy.as_deref(),
+            connect_timeout: self.connect_timeout,
+            read_timeout,
+            interrupt: self.interrupt.as_ref(),
+        };
+        for attempt in 1..=max_attempts {
+            if self.interrupted() {
+                return Err(INTERRUPTED.to_string());
+            }
+            let mut buffered: Vec<WireEvent> = Vec::new();
+            let mut first_error = None;
+            let result = crate::websocket::send(
+                &target,
+                body,
+                &mut |info| {
+                    let sent = emit(StreamEvent::Connected)
+                        .and_then(|()| emit(StreamEvent::Transport(info.clone())));
+                    if let Err(error) = &sent {
+                        first_error = Some(error.clone());
+                    }
+                    sent
+                },
+                &mut |event| match event {
+                    event @ (WireEvent::Delta(_) | WireEvent::ReasoningDelta(_)) => {
+                        emit(StreamEvent::Wire(event))
+                    }
+                    other => {
+                        buffered.push(other);
+                        Ok(())
+                    }
+                },
+            );
+            let failure = match result {
+                Ok(sent) => {
+                    for event in buffered {
+                        emit(StreamEvent::Wire(event))?;
+                    }
+                    return Ok(sent.items);
+                }
+                Err(_) if self.interrupted() => return Err(INTERRUPTED.to_string()),
+                Err(Failure::Interrupted) => return Err(INTERRUPTED.to_string()),
+                Err(failure) => failure,
+            };
+            // The caller's own error (a steer, an interrupt) ends the
+            // request as it is.
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            match failure {
+                Failure::BeforeFirstEvent { message, .. } | Failure::Unsupported(message)
+                    if auto =>
+                {
+                    crate::websocket::remember_fallback(url, &message);
+                    let info = crate::websocket::TransportInfo::https(Some(message));
+                    return self.stream_http(protocol, url, body, read_timeout, Some(info), emit);
+                }
+                Failure::BeforeFirstEvent {
+                    message,
+                    status,
+                    retry_after,
+                } => {
+                    let error = RequestError {
+                        status,
+                        message,
+                        retry_after,
+                    };
+                    if attempt < max_attempts && error.is_retryable() {
+                        self.wait_to_retry(
+                            attempt,
+                            max_attempts,
+                            &error.message,
+                            error.retry_after,
+                            emit,
+                        )?;
+                        continue;
+                    }
+                    return Err(error.message);
+                }
+                Failure::Unsupported(message) => return Err(message),
+                Failure::Status { status, message } => {
+                    let error = RequestError {
+                        status: Some(status),
+                        message,
+                        retry_after: None,
+                    };
+                    if attempt < max_attempts && error.is_retryable() {
+                        self.wait_to_retry(attempt, max_attempts, &error.message, None, emit)?;
+                        continue;
+                    }
+                    return Err(error.message);
+                }
+                Failure::Stream(error) => {
+                    if attempt < max_attempts && is_retryable_stream_error(&error) {
+                        self.wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                        continue;
+                    }
+                    // A reply without an answer still spent its tokens.
+                    if crate::NoAnswer::from_error(&error).is_some() {
+                        for event in buffered {
+                            if let WireEvent::Usage(usage) = event {
+                                emit(StreamEvent::Wire(WireEvent::Usage(usage)))?;
+                            }
+                        }
+                    }
+                    return Err(error);
+                }
+                Failure::Interrupted => return Err(INTERRUPTED.to_string()),
+            }
+        }
+        unreachable!("WebSocket retry loop always returns")
+    }
+
     /// Reads a response body as text: streamed deltas are forwarded to `emit`
     /// as they arrive, non-streaming JSON is flattened to its message text.
     pub fn read_text(
@@ -579,19 +801,27 @@ pub fn azure_api_version() -> String {
 /// One agent per timeout pair, kept for the process: its pool keeps the TLS
 /// connection to a provider open between requests, so a turn's tool rounds
 /// skip the handshake (a second or more through a proxy) after the first.
-fn shared_agent(connect_timeout: Duration, read_timeout: Duration) -> ureq::Agent {
-    static AGENTS: OnceLock<Mutex<HashMap<(Duration, Duration), ureq::Agent>>> = OnceLock::new();
+fn shared_agent(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    proxy: Option<&str>,
+) -> ureq::Agent {
+    type Key = (Duration, Duration, Option<String>);
+    static AGENTS: OnceLock<Mutex<HashMap<Key, ureq::Agent>>> = OnceLock::new();
     let mut agents = AGENTS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     agents
-        .entry((connect_timeout, read_timeout))
+        .entry((connect_timeout, read_timeout, proxy.map(str::to_string)))
         .or_insert_with(|| {
-            ureq::AgentBuilder::new()
+            let builder = ureq::AgentBuilder::new()
                 .timeout_connect(connect_timeout)
-                .timeout_read(read_timeout)
-                .build()
+                .timeout_read(read_timeout);
+            match proxy.and_then(|proxy| ureq::Proxy::new(proxy).ok()) {
+                Some(proxy) => builder.proxy(proxy).build(),
+                None => builder.build(),
+            }
         })
         .clone()
 }
@@ -1006,6 +1236,10 @@ mod tests {
             cache_debug: false,
             model_headers: HashMap::new(),
             headers: Vec::new(),
+            // The HTTPS tests: the WebSocket ones are in tests/websocket.rs.
+            transport: crate::websocket::TransportMode::Http,
+            proxy: None,
+            lane: String::new(),
         }
     }
 

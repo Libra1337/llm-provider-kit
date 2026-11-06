@@ -35,6 +35,7 @@ pub mod omp;
 pub mod providers;
 pub mod responses;
 pub mod transport;
+pub mod websocket;
 
 pub use providers::{templates, ModelTemplate, ProviderTemplate};
 
