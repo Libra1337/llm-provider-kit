@@ -279,6 +279,8 @@ fn create_message(body: &Value, continuation: Option<&Continuation>) -> (Value, 
 }
 
 /// The input after what the server holds, when `input` starts with it.
+/// Items compare as sent (`responses::request_body` sanitizes them; the
+/// held output is sanitized the same way).
 fn tail_after(input: &[Value], state: &Continuation) -> Option<(String, Vec<Value>)> {
     let held = state.history.len();
     (input.len() >= held && input[..held] == state.history[..])
@@ -499,14 +501,19 @@ pub(crate) struct Sent {
     pub info: TransportInfo,
 }
 
+/// What a request hands on as its response arrives.
+pub(crate) enum Delivery {
+    /// The first event came: how the request travelled.
+    First(TransportInfo),
+    /// A decoded event, as the HTTPS stream would give it.
+    Wire(crate::WireEvent),
+}
+
 /// Sends `body` over a pooled or new connection and reads its response.
-/// `on_event` gets each decoded event as the HTTPS stream would give it;
-/// `on_first` runs once, when the first event arrives (with how it went).
 pub(crate) fn send(
     target: &Target<'_>,
     body: &Value,
-    on_first: &mut dyn FnMut(&TransportInfo) -> Result<(), String>,
-    on_event: &mut dyn FnMut(crate::WireEvent) -> Result<(), String>,
+    deliver: &mut dyn FnMut(Delivery) -> Result<(), String>,
 ) -> Result<Sent, Failure> {
     let ws_url = websocket_url(target.url);
     let lane = format!("{ws_url} {}", target.lane_key);
@@ -522,12 +529,18 @@ pub(crate) fn send(
     let mut tried_limit = false;
     loop {
         let (mut connection, reused) = match pooled.take() {
-            Some(mut connection) if connection.alive() => (connection, true),
-            _ => (open(target, &ws_url, &lane, fingerprint)?, false),
+            Some(mut connection) => {
+                if connection.alive() {
+                    (connection, true)
+                } else {
+                    (open(target, &ws_url, &lane, fingerprint)?, false)
+                }
+            }
+            None => (open(target, &ws_url, &lane, fingerprint)?, false),
         };
         let mut continuation = connection.continuation.take();
         loop {
-            match request(&mut connection, target, body, continuation.as_ref(), reused, on_first, on_event) {
+            match request(&mut connection, target, body, continuation.as_ref(), reused, deliver) {
                 Ok(sent) => {
                     connection.idle_since = Instant::now();
                     checkin(connection);
@@ -588,8 +601,7 @@ fn request(
     body: &Value,
     continuation: Option<&Continuation>,
     reused: bool,
-    on_first: &mut dyn FnMut(&TransportInfo) -> Result<(), String>,
-    on_event: &mut dyn FnMut(crate::WireEvent) -> Result<(), String>,
+    deliver: &mut dyn FnMut(Delivery) -> Result<(), String>,
 ) -> Result<Sent, Attempt> {
     let (message, incremental) = create_message(body, continuation);
     let text = message.to_string();
@@ -670,7 +682,7 @@ fn request(
         }
         if first {
             first = false;
-            on_first(&info).map_err(Failure::Stream)?;
+            deliver(Delivery::First(info.clone())).map_err(Failure::Stream)?;
         }
         // The v1 name of `response.completed`.
         if kind == "response.done" {
@@ -680,7 +692,7 @@ fn request(
             return Err(Failure::Stream(event.to_string()).into());
         }
         let done = decoder
-            .feed(&event.to_string(), &mut *on_event)
+            .feed(&event.to_string(), &mut |event| deliver(Delivery::Wire(event)))
             .map_err(Failure::Stream)?;
         if done {
             connection.continuation = continuation_after(

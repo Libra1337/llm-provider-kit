@@ -591,7 +591,7 @@ impl Client {
         read_timeout: Duration,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
-        use crate::websocket::{Failure, Target, TransportMode};
+        use crate::websocket::{Delivery, Failure, Target, TransportMode};
         let auto = self.transport == TransportMode::Auto;
         let max_attempts = self.max_attempts();
         let mut headers = self.request_headers(protocol, url, body);
@@ -616,28 +616,26 @@ impl Client {
                 return Err(INTERRUPTED.to_string());
             }
             let mut buffered: Vec<WireEvent> = Vec::new();
-            let mut first_error = None;
-            let result = crate::websocket::send(
-                &target,
-                body,
-                &mut |info| {
-                    let sent = emit(StreamEvent::Connected)
-                        .and_then(|()| emit(StreamEvent::Transport(info.clone())));
-                    if let Err(error) = &sent {
-                        first_error = Some(error.clone());
-                    }
-                    sent
-                },
-                &mut |event| match event {
-                    event @ (WireEvent::Delta(_) | WireEvent::ReasoningDelta(_)) => {
-                        emit(StreamEvent::Wire(event))
-                    }
-                    other => {
+            let mut caller_error = None;
+            let result = crate::websocket::send(&target, body, &mut |delivery| {
+                let handed = match delivery {
+                    Delivery::First(info) => emit(StreamEvent::Connected)
+                        .and_then(|()| emit(StreamEvent::Transport(info))),
+                    Delivery::Wire(
+                        event @ (WireEvent::Delta(_) | WireEvent::ReasoningDelta(_)),
+                    ) => emit(StreamEvent::Wire(event)),
+                    Delivery::Wire(other) => {
                         buffered.push(other);
                         Ok(())
                     }
-                },
-            );
+                };
+                // The caller's own error (a steer, an interrupt) ends the
+                // request as it is.
+                if let Err(error) = &handed {
+                    caller_error = Some(error.clone());
+                }
+                handed
+            });
             let failure = match result {
                 Ok(sent) => {
                     for event in buffered {
@@ -649,9 +647,7 @@ impl Client {
                 Err(Failure::Interrupted) => return Err(INTERRUPTED.to_string()),
                 Err(failure) => failure,
             };
-            // The caller's own error (a steer, an interrupt) ends the
-            // request as it is.
-            if let Some(error) = first_error {
+            if let Some(error) = caller_error {
                 return Err(error);
             }
             match failure {

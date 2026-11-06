@@ -286,8 +286,11 @@ fn user(text: &str) -> Value {
     json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] })
 }
 
+/// A request body as `responses::request_body` builds one (its input
+/// sanitized: no item ids).
 fn body(input: &[Value]) -> Value {
-    json!({ "model": "gpt-test", "instructions": "be brief", "input": input, "tools": [], "store": false, "stream": true })
+    json!({ "model": "gpt-test", "instructions": "be brief", "input": crate::responses::sanitize_input(input.to_vec()),
+            "tools": [], "store": false, "stream": true })
 }
 
 /// One request; what it returned and how it travelled.
